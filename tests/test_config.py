@@ -159,5 +159,27 @@ class TestConfigValidation(unittest.TestCase):
         self.assertIn("не найден", str(cm.exception))
 
 
+class TestConfigDefault(unittest.TestCase):
+    """Config.default() — первый запуск calibrate без файла."""
+
+    def test_default_is_valid_and_has_line_counter(self):
+        cfg = Config.default()
+        self.assertEqual(len(cfg.counters), 1)
+        c = cfg.counters[0]
+        self.assertEqual(c.id, "main_line")
+        self.assertEqual(c.type, "line")
+        for x, y in (c.a, c.b):
+            self.assertTrue(0.0 <= x <= 1.0 and 0.0 <= y <= 1.0)
+
+    def test_default_save_load_roundtrip(self):
+        import tempfile
+        cfg = Config.default()
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "config.yaml"
+            Config.save(cfg, p)
+            loaded = Config.load(p)
+        self.assertEqual(loaded.to_dict(), cfg.to_dict())
+
+
 if __name__ == "__main__":
     unittest.main()

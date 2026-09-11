@@ -489,6 +489,18 @@ class Config:
         return cls.from_dict(raw if isinstance(raw, dict) else {}, str(p))
 
     @classmethod
+    def default(cls) -> "Config":
+        """Конфиг по умолчанию (значения как в config.example.yaml).
+
+        Используется calibrate при отсутствии файла: оператор калибрует линию/зону,
+        а файл создаётся при сохранении. Включает один line-счётчик ``main_line`` —
+        без счётчика калибровать нечего.
+        """
+        return cls(
+            counters=[LineCounterConfig(id="main_line", a=(0.25, 0.35), b=(0.75, 0.85))],
+        )
+
+    @classmethod
     def from_dict(cls, d: Any, source: str = "<dict>") -> "Config":
         """Собрать Config из словаря с полной валидацией типов/диапазонов."""
         _check_unknown_keys(

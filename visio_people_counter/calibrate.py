@@ -254,11 +254,17 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         print(f"calibrate: ОШИБКА: {GuiPlayer.unavailable_reason()}", file=sys.stderr)
         return 1
 
-    try:
-        cfg = Config.load(config_path)
-    except ConfigError as e:
-        print(f"calibrate: ошибка конфигурации: {e}", file=sys.stderr)
-        return 1
+    if Path(config_path).is_file():
+        try:
+            cfg = Config.load(config_path)
+        except ConfigError as e:
+            print(f"calibrate: ошибка конфигурации: {e}", file=sys.stderr)
+            return 1
+    else:
+        # первый запуск: файла ещё нет — калибруем по дефолтам и создадим файл при [a]
+        cfg = Config.default()
+        print(f"calibrate: файл {config_path} не найден — запускаю с настройками по умолчанию; "
+              f"конфиг будет создан при сохранении [a] (остальные режимы требуют готовый конфиг)")
     if video:
         cfg.video.path = video
     if not cfg.video.path:

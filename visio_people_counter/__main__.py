@@ -139,7 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_count.set_defaults(func=cmd_count)
 
     p_cal = sub.add_parser("calibrate", help="GUI-калибровка линии/зоны/size-точек → config.yaml")
-    p_cal.add_argument("--config", default="config.yaml", help="путь к config.yaml")
+    p_cal.add_argument("--config", default="config.yaml",
+                       help="путь к config.yaml; если файла нет — калибровка по дефолтам, "
+                            "файл будет создан при сохранении (для count/probe конфиг обязателен)")
     p_cal.add_argument("--video", default=None, metavar="PATH|URL",
                        help="видео для калибровки (переопределяет video.path)")
     p_cal.add_argument("--counter-id", default="main_line", metavar="ID",
