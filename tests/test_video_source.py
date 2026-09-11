@@ -1,0 +1,160 @@
+"""Тесты video_source.py на синтетическом mp4 (cv2.VideoWriter, 'mp4v').
+
+Временное видео: 960x540, 30 fps, 30 кадров, движущийся белый квадрат.
+Файл создаётся один раз на класс (setUpClass).
+"""
+
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+
+from visio_people_counter.video_source import (  # noqa: E402
+    FileSource, FfmpegPipeSource, VideoSourceError, ffprobe_info,
+)
+
+W, H, FPS, N_FRAMES = 960, 540, 30.0, 30
+
+
+def _make_video(path: Path) -> None:
+    """Синтетический mp4: тёмный фон + движущийся белый квадрат."""
+    vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), FPS, (W, H))
+    assert vw.isOpened(), "не удалось открыть VideoWriter для синтетического mp4"
+    for i in range(N_FRAMES):
+        frame = np.full((H, W, 3), 30, dtype=np.uint8)
+        x = 10 + i * (W - 220) // (N_FRAMES - 1)   # квадрат едет слева направо
+        cv2.rectangle(frame, (x, H // 2 - 60), (x + 160, H // 2 + 60), (255, 255, 255), -1)
+        vw.write(frame)
+    vw.release()
+
+
+class _VideoMixin:
+    """Создаёт временное видео перед классом и удаляет после."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory(prefix="vpc_test_video_")
+        cls.video_path = Path(cls._td.name) / "synth.mp4"
+        _make_video(cls.video_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+
+class TestFileSource(_VideoMixin, unittest.TestCase):
+    def test_reads_all_frames(self):
+        with FileSource(str(self.video_path)) as src:
+            self.assertEqual(src.width, W)
+            self.assertEqual(src.height, H)
+            self.assertAlmostEqual(src.fps, FPS, delta=0.5)
+            frames = []
+            while True:
+                f = src.read()
+                if f is None:
+                    break
+                frames.append(f)
+        self.assertEqual(len(frames), N_FRAMES)
+        for i, f in enumerate(frames):
+            self.assertEqual(f.index, i)
+            self.assertEqual(f.image.shape, (H, W, 3))
+            self.assertGreater(f.image.mean(), 20)   # не чёрный (есть квадрат)
+
+    def test_loop_file(self):
+        with FileSource(str(self.video_path), loop_file=True) as src:
+            total = 0
+            saw_wrap = False
+            prev_index = -1
+            for _ in range(N_FRAMES * 2 + 5):
+                f = src.read()
+                if f is None:
+                    break
+                if f.index < prev_index:
+                    saw_wrap = True
+                prev_index = f.index
+                total += 1
+        self.assertGreaterEqual(total, N_FRAMES)      # дошёл хотя бы до первого EOF
+        self.assertTrue(saw_wrap, "loop_file должен перемотать в начало")
+
+    def test_missing_file(self):
+        with self.assertRaises(VideoSourceError):
+            FileSource("/nonexistent/nope.mp4").open()
+
+
+class TestFfmpegPipeSource(_VideoMixin, unittest.TestCase):
+    def test_ffprobe_info(self):
+        info = ffprobe_info(str(self.video_path))
+        self.assertEqual(info["width"], W)
+        self.assertEqual(info["height"], H)
+        self.assertIsNotNone(info["fps"])
+        self.assertGreater(info["fps"], 0)
+        self.assertIn("codec_name", info)
+
+    def test_same_frame_sequence_as_file(self):
+        with FfmpegPipeSource(str(self.video_path)) as src:
+            self.assertEqual(src.width, W)
+            self.assertEqual(src.height, H)
+            frames = []
+            while True:
+                f = src.read()
+                if f is None:
+                    break
+                frames.append(f)
+        # та же последовательность кадров (±1 на границах декодера)
+        self.assertAlmostEqual(len(frames), N_FRAMES, delta=2)
+        for i, f in enumerate(frames):
+            self.assertEqual(f.index, i)
+        # контент: квадрат светлее фона
+        first = frames[0].image
+        self.assertGreater(first[:, :, 0].max(), 200)
+
+    def test_effective_fps_and_max_width(self):
+        t0 = time.monotonic()
+        with FfmpegPipeSource(
+            str(self.video_path),
+            effective_fps=10,
+            max_width=640,
+        ) as src:
+            # 960 -> 640, высота 540*640/960 = 360 (чётная)
+            self.assertEqual(src.width, 640)
+            self.assertEqual(src.height, 360)
+            self.assertEqual(src.fps, 10.0)
+            frames = []
+            while True:
+                f = src.read()
+                if f is None:
+                    break
+                frames.append(f)
+        elapsed = time.monotonic() - t0
+        # 30 кадров @30fps = 1 c видео; при -r 10 получаем ~10 кадров
+        self.assertTrue(8 <= len(frames) <= 12, f"ожидалось ~10 кадров, получено {len(frames)}")
+        for f in frames:
+            self.assertEqual(f.image.shape, (360, 640, 3))
+        # скорость: ffmpeg с файловым входом режет fps быстрее реального времени —
+        # 1 c видео не должно занимать заметно больше секунды wall-time
+        self.assertLess(elapsed, 5.0)
+
+    def test_unavailable_input_no_reconnect(self):
+        # несуществующий вход + reconnect_attempts=-1: ffmpeg умирает сразу,
+        # watchdog не переподключается -> read() стабильно возвращает None
+        src = FfmpegPipeSource(
+            "/nonexistent/stream.m3u8",
+            reconnect_attempts=-1,
+            reconnect_backoff_s=0.05,
+            bad_read_threshold=2,
+        )
+        self.addCleanup(src.close)
+        with self.assertRaises(VideoSourceError):
+            src.open()   # ffprobe не находит вход
+
+
+
+if __name__ == "__main__":
+    unittest.main()

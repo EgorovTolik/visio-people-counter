@@ -1,0 +1,6 @@
+# visio-people-counter — зависимости (устанавливать в .venv проекта)
+# .venv создаётся: python3 -m venv --system-site-packages .venv
+# ffmpeg/ffprobe — системные, уже установлены.
+supervision==0.30.2
+trackers==2.6.0
+PyYAML>=6.0

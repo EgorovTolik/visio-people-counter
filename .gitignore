@@ -1,0 +1,8 @@
+references/repos/
+__pycache__/
+*.pyc
+.venv/
+videos/
+*.mp4
+*.ts
+*.m3u8
