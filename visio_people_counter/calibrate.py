@@ -37,6 +37,7 @@ from .config import (
     ZoneCounterConfig,
 )
 from .gui import GuiPlayer
+from .text_overlay import put_text
 from .motion_detector import MotionDetector
 from .pipeline import Pipeline
 from .video_source import VideoSourceError
@@ -190,6 +191,7 @@ def _fmt_pt(p: tuple[float, float]) -> str:
 # Интерактивный цикл (окно — только здесь)
 # ---------------------------------------------------------------------------
 
+#: Подсказки на экране (рисуются через text_overlay.put_text — кириллица поддерживается).
 _HINTS = {
     None: "режимы: [l]иния 2 клика | [z]она N кликов+Enter | [s]ize точка+цифра 1-9\n"
           "[m]аска движения | [n/p] кадр вперёд/назад | [a]применить и сохранить | [q]выход",
@@ -197,6 +199,8 @@ _HINTS = {
     "zone": "ЗОНА: кликайте углы полигона; Enter — замкнуть (>=3), 'z' — начать заново",
     "size": "SIZE: кликните X-точку, затем цифру 1-9 (1=5% ... 9=45% высоты кадра); Enter — завершить",
 }
+
+
 
 
 def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
@@ -238,18 +242,36 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
 
     # подсказки сверху
-    y = 34
+    y = 10
     for line in _HINTS[state.mode].split("\n"):
-        cv2.putText(img, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (255, 255, 255), 2, cv2.LINE_AA)
-        y += 28
+        put_text(img, line, (10, y), size_px=16, color=(255, 255, 255))
+        y += 24
     return img
+
+
+def calibration_save_target(video_type: str, video_path: str,
+                            config_path: str | Path) -> Path:
+    """Куда calibrate сохраняет конфиг при [a].
+
+    file → рядом с видео: ``<имя_видео>.config.yaml`` (stem без расширения);
+    hls/URL → путь из --config («рядом» для потока не определено).
+    """
+    if video_type == "file":
+        p = Path(video_path)
+        return p.with_name(f"{p.stem}.config.yaml")
+    return Path(config_path)
 
 
 def run_calibration(config_path: str | Path, video: Optional[str] = None,
                     counter_id: str = "main_line",
-                    window_name: str = "calibrate [l/z/s/m/a/q]") -> int:
-    """Интерактивная калибровка. :returns: 0 — корректное завершение (запись опциональна)."""
+                    window_name: str = "calibrate [l/z/s/m/a/q]",
+                    save_to: Optional[str | Path] = None) -> int:
+    """Интерактивная калибровка.
+
+    :param save_to: если задан (например, явный --config) — результат пишется строго туда;
+        иначе по умолчанию рядом с видео: ``<имя_видео>.config.yaml``.
+    :returns: 0 — корректное завершение (запись опциональна).
+    """
     if not GuiPlayer.available():
         print(f"calibrate: ОШИБКА: {GuiPlayer.unavailable_reason()}", file=sys.stderr)
         return 1
@@ -264,7 +286,8 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         # первый запуск: файла ещё нет — калибруем по дефолтам и создадим файл при [a]
         cfg = Config.default()
         print(f"calibrate: файл {config_path} не найден — запускаю с настройками по умолчанию; "
-              f"конфиг будет создан при сохранении [a] (остальные режимы требуют готовый конфиг)")
+              f"результат будет сохранён рядом с видео (<имя_видео>.config.yaml) при [a] "
+              f"(остальные режимы требуют готовый конфиг)")
     if video:
         cfg.video.path = video
     if not cfg.video.path:
@@ -282,6 +305,17 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         print(f"calibrate: ошибка источника: {e}", file=sys.stderr)
         return 1
     w, h = pipe.source.width, pipe.source.height
+
+    # Куда сохранять при [a]: явный save_to (--config) → строго туда; иначе рядом
+    # с файлом видео как <имя_видео>.config.yaml; для HLS/URL фолбэк на --config.
+    if save_to is not None:
+        save_target = Path(save_to)
+    else:
+        save_target = calibration_save_target(cfg.video.type, cfg.video.path, config_path)
+        if cfg.video.type != "file":
+            print(f"calibrate: источник HLS/URL — конфиг будет сохранён в {save_target} "
+                  f"(«рядом с видео» для потока не определено)")
+    print(f"calibrate: результат [a] → {save_target}")
 
     detector = MotionDetector(cfg)   # для 'm' — live-маска движения
     frames: list[np.ndarray] = []
@@ -325,8 +359,8 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
             img = _draw_calibration(base, state, mask_on, masks[idx], w, h)
             hint_lines = _HINTS[state.mode].split("\n")
             for i, msg in enumerate(pending_msgs):
-                cv2.putText(img, msg[:80], (10, 34 + 28 * len(hint_lines) + i * 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+                put_text(img, msg[:80], (10, 34 + 24 * len(hint_lines) + i * 20),
+                         size_px=14, color=(0, 0, 255))
             pending_msgs.clear()
             cv2.imshow(window_name, img)
             key = cv2.waitKey(1) & 0xFF
@@ -360,13 +394,16 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
                 try:
                     changed = apply_calibration(cfg, state)
                     if not changed:
-                        pending_msgs.append("ничего не менялось — нет собранных линий/зон/size-точек")
+                        pending_msgs.append(
+                        "ничего не менялось — нет собранных линий/зон/size-точек")
                     else:
-                        Config.save(cfg, config_path)
+                        Config.save(cfg, save_target)
                         saved_once = True
-                        print(f"calibrate: сохранено в {config_path}:")
+                        print(f"calibrate: сохранено в {save_target}:")
                         for line in changed:
                             print(f"  - {line}")
+                        print(f"calibrate: дальше — "
+                              f".venv/bin/python -m visio_people_counter count --config {save_target}")
                 except (ConfigError, OSError) as e:
                     pending_msgs.append(f"ошибка записи: {e}")
     finally:

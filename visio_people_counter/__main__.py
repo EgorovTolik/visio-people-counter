@@ -106,9 +106,14 @@ def cmd_count(args: argparse.Namespace) -> int:
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
-    """GUI-калибровка линии/зоны/size-точек → запись в config.yaml (задача 16)."""
+    """GUI-калибровка линии/зоны/size-точек.
+
+    Без явного --config результат сохраняется рядом с видео (<имя_видео>.config.yaml);
+    с явным --config — строго в этот файл (он же используется как входной, если есть).
+    """
     from .calibrate import run_calibration
-    return run_calibration(args.config, video=args.video, counter_id=args.counter_id)
+    return run_calibration(args.config or "config.yaml", video=args.video,
+                           counter_id=args.counter_id, save_to=args.config)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -139,9 +144,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_count.set_defaults(func=cmd_count)
 
     p_cal = sub.add_parser("calibrate", help="GUI-калибровка линии/зоны/size-точек → config.yaml")
-    p_cal.add_argument("--config", default="config.yaml",
-                       help="путь к config.yaml; если файла нет — калибровка по дефолтам, "
-                            "файл будет создан при сохранении (для count/probe конфиг обязателен)")
+    p_cal.add_argument("--config", default=None,
+                       help="входной конфиг; если опция задана ЯВНО — результат [a] "
+                            "сохраняется строго в этот файл. Без опции результат пишется "
+                            "рядом с видео: <имя_видео>.config.yaml. Файла входного конфига "
+                            "может не быть (калибровка по дефолтам); для count/probe конфиг обязателен")
     p_cal.add_argument("--video", default=None, metavar="PATH|URL",
                        help="видео для калибровки (переопределяет video.path)")
     p_cal.add_argument("--counter-id", default="main_line", metavar="ID",

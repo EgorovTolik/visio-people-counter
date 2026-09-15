@@ -73,6 +73,7 @@ import numpy as np
 
 from .config import CounterConfig, LineCounterConfig, ZoneCounterConfig
 from .size_profile import SizeProfile
+from .text_overlay import put_text
 from .tracker_adapter import TrackedObject
 
 #: сколько секунд можно не видеть трек перед удалением его состояния (анти-утечка).
@@ -331,8 +332,8 @@ class LineCounter(BaseCounter):
         a = (int(round(self._a[0])), int(round(self._a[1])))
         b = (int(round(self._b[0])), int(round(self._b[1])))
         cv2.line(frame, a, b, (0, 255, 0), 2)
-        cv2.putText(frame, self.label_text(), (max(0, a[0] + 8), max(16, a[1] - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        put_text(frame, self.label_text(), (max(0, a[0] + 8), max(16, a[1] - 8)),
+                 size_px=16, color=(0, 255, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +426,8 @@ class ZoneCounter(BaseCounter):
         pts = np.round(self._poly).astype(np.int32).reshape(-1, 1, 2)
         cv2.polylines(frame, [pts], True, (0, 255, 255), 2)
         x, y = int(self._poly[0][0]), int(self._poly[0][1])
-        cv2.putText(frame, self.label_text(), (x + 8, max(16, y - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+        put_text(frame, self.label_text(), (x + 8, max(16, y - 8)),
+                 size_px=16, color=(0, 255, 255))
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ Headless-фолбэк: :meth:`GuiPlayer.available` — чистая провер
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import cv2
@@ -27,6 +28,7 @@ import numpy as np
 
 from .config import Config, DebugConfig
 from .line_counter import BaseCounter
+from .text_overlay import put_text, text_width
 from .motion_detector import Blob
 from .pipeline import Pipeline, save_debug_frame
 from .tracker_adapter import TrackedObject
@@ -35,6 +37,32 @@ from .video_source import FfmpegPipeSource
 #: допустимый диапазон скорости воспроизведения (CLI --speed и клавиши +/-).
 MIN_SPEED = 0.25
 MAX_SPEED = 8.0
+
+
+#: системная папка плагинов Qt5 (там живёт platformtheme gtk3/gtk2)
+_SYSTEM_QT_PLUGIN_DIR = "/usr/lib/x86_64-linux-gnu/qt5/plugins"
+
+
+def apply_qt_env() -> None:
+    """Поправить окружение для встроенного Qt в колесе opencv-python.
+
+    OpenCV 5 HighGUI (наш бэкенд — QT5) тянет **свой** Qt из site-packages и не видит
+    системные плагины: без platformtheme диалоги (например, QFileDialog встроенной
+    фичи «Save current image» по Ctrl+S/иконке дискеты в тулбаре окна) рисуются чужим
+    стилем с пустыми подписями папок. Подключаем системный gtk3-плагин, чтобы Qt брал
+    шрифты/тему из GTK-сессии.
+    """
+    if os.path.isdir(_SYSTEM_QT_PLUGIN_DIR):
+        cur = os.environ.get("QT_PLUGIN_PATH", "")
+        parts = [p for p in cur.split(os.pathsep) if p]
+        if _SYSTEM_QT_PLUGIN_DIR not in parts:
+            parts.append(_SYSTEM_QT_PLUGIN_DIR)
+            os.environ["QT_PLUGIN_PATH"] = os.pathsep.join(parts)
+    os.environ.setdefault("QT_QPA_PLATFORMTHEME", "gtk3")
+
+
+# до первого cv2.imshow/namedWindow (создание QApplication) — на момент импорта модуля
+apply_qt_env()
 
 
 def clamp_speed(speed: float) -> float:
@@ -112,19 +140,17 @@ class GuiOverlay:
                 c.draw(frame)
             y = 36
             for c in counters:
-                label = c.label_text()
-                # чёрная тень под белым текстом — читаемость над ярким фоном
-                cv2.putText(frame, label, (11, y + 1), self.FONT, 0.8,
-                            (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(frame, label, (10, y), self.FONT, 0.8,
-                            (255, 255, 255), 2, cv2.LINE_AA)
+                # put_text: кириллические id счётчиков тоже отрисовываются (PIL/TTF);
+                # чёрная тень включена — читаемость над ярким фоном
+                put_text(frame, c.label_text(), (10, y), size_px=22,
+                         color=(255, 255, 255))
                 y += 34
 
         if status_text:
             w = frame.shape[1]
-            tw = cv2.getTextSize(status_text, self.FONT, 0.6, 2)[0][0]
-            cv2.putText(frame, status_text, (max(0, w - tw - 10), 28), self.FONT,
-                        0.6, (0, 255, 255), 2, cv2.LINE_AA)
+            tw = text_width(status_text, size_px=16)
+            put_text(frame, status_text, (max(0, w - tw - 10), 12),
+                     size_px=16, color=(0, 255, 255))
         return frame
 
 
@@ -147,8 +173,10 @@ class GuiPlayer:
     **-**/**−** — скорость ×1.5 / ÷1.5 (в пределах 0.25..8).
     """
 
+    #: Имя окна — только ASCII: GNOME/GTK использует заголовок для имени файла
+    #: в диалогах сохранения, и кириллица там превращается в «_».
     DEFAULT_WINDOW = ("visio-people-counter "
-                      "[space]=пауза [q/ESC]=выход [+/-]=скорость")
+                      "[space]=pause [q/ESC]=quit [+/-]=speed")
 
     def __init__(self, pipeline: Pipeline, speed: float = 1.0,
                  window_name: str | None = None) -> None:

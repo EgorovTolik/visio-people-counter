@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -273,6 +274,48 @@ class TestConfigRoundtrip(unittest.TestCase):
 # headless: available() без исключений и без окна
 # ---------------------------------------------------------------------------
 
+class TestCalibrationSaveTarget(unittest.TestCase):
+    """Путь сохранения calibrate: по умолчанию <имя_видео>.config.yaml рядом с видео."""
+
+    def test_file_video_template(self):
+        from visio_people_counter.calibrate import calibration_save_target
+        p = calibration_save_target("file", "videos/demo.mp4", "config.yaml")
+        self.assertEqual(p, Path("videos/demo.config.yaml"))
+
+    def test_nested_path_and_weird_name(self):
+        from visio_people_counter.calibrate import calibration_save_target
+        p = calibration_save_target("file", "/a/b/моя камера (1).avi", "config.yaml")
+        self.assertEqual(p, Path("/a/b/моя камера (1).config.yaml"))
+
+    def test_hls_fallback_to_config(self):
+        from visio_people_counter.calibrate import calibration_save_target
+        p = calibration_save_target("hls", "https://cam/x/stream.m3u8", "my/conf.yaml")
+        self.assertEqual(p, Path("my/conf.yaml"))
+
+
+class TestApplyQtEnv(unittest.TestCase):
+    """apply_qt_env: встроенный Qt из колеса opencv должен видеть системный gtk3-плагин."""
+
+    def test_sets_plugin_path_and_theme_idempotent(self):
+        import visio_people_counter.gui as gui
+        saved = {k: os.environ.get(k) for k in ("QT_PLUGIN_PATH", "QT_QPA_PLATFORMTHEME")}
+        try:
+            for k in saved:
+                os.environ.pop(k, None)
+            gui.apply_qt_env()
+            self.assertIn(gui._SYSTEM_QT_PLUGIN_DIR, os.environ["QT_PLUGIN_PATH"])
+            self.assertEqual(os.environ["QT_QPA_PLATFORMTHEME"], "gtk3")
+            before = os.environ["QT_PLUGIN_PATH"]
+            gui.apply_qt_env()  # повторный вызов — без дублей
+            self.assertEqual(os.environ["QT_PLUGIN_PATH"], before)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 class TestGuiPlayerHeadless(unittest.TestCase):
 
     def test_available_returns_bool_without_window(self):
@@ -293,6 +336,68 @@ class TestGuiPlayerHeadless(unittest.TestCase):
     def test_unavailable_reason_is_clear(self):
         msg = GuiPlayer.unavailable_reason()
         self.assertTrue("GUI" in msg or "gui" in msg)
+
+
+class TestTextOverlay(unittest.TestCase):
+    """text_overlay: кириллица через PIL/TTF, фолбэк — ASCII без ошибок."""
+
+    def test_cyrillic_renders_pixels(self):
+        import numpy as np
+        from visio_people_counter.text_overlay import put_text
+        frame = np.zeros((120, 512, 3), np.uint8)
+        put_text(frame, "СЧЁТ: вх=3 вых=1", (10, 10), size_px=20,
+                 color=(0, 255, 0))
+        green = int(((frame[..., 1] > 60) & (frame[..., 0] < 60)
+                     & (frame[..., 2] < 60)).sum())
+        self.assertGreater(green, 300, "кириллический текст не отрисовался")
+
+    def test_text_color_bgr_respected(self):
+        import numpy as np
+        from visio_people_counter.text_overlay import put_text
+        frame = np.zeros((60, 200, 3), np.uint8)
+        put_text(frame, "тест", (5, 5), size_px=18, color=(255, 0, 0))  # BGR: красный
+        red_px = int(((frame[..., 2] > 60) & (frame[..., 0] < 60)).sum())
+        self.assertGreater(red_px, 30)
+
+    def test_text_outside_frame_does_not_crash(self):
+        import numpy as np
+        from visio_people_counter.text_overlay import put_text
+        frame = np.zeros((40, 40, 3), np.uint8)
+        for org in ((-50, -50), (39, 39), (1000, 1000)):
+            put_text(frame, "за краем", org, size_px=16)  # без исключений
+
+    def test_fallback_path_ascii(self):
+        import numpy as np
+        from visio_people_counter import text_overlay as to
+        frame = np.zeros((60, 200, 3), np.uint8)
+        to._fallback_put_text(frame, "линия in=1", (5, 5), size_px=18,
+                              color_bgr=(255, 255, 255), shadow=True)
+        self.assertGreater(int((frame.sum(axis=2) > 60).sum()), 30)
+
+    def test_counter_label_with_cyrillic_id_renders(self):
+        # id счётчика с русскими буквами не должен ломать/прятать подпись
+        import numpy as np
+        from visio_people_counter.config import LineCounterConfig
+        from visio_people_counter.line_counter import LineCounter
+        lc = LineCounter(LineCounterConfig(id="вход", a=(0.25, 0.35), b=(0.75, 0.85)),
+                         w=640, h=360)
+        frame = np.zeros((360, 640, 3), np.uint8)
+        lc.draw(frame)  # не бросает исключение
+        self.assertGreater(int((frame.sum(axis=2) > 60).sum()), 100)
+
+    def test_calibrate_hints_drawn_with_cyrillic(self):
+        import numpy as np
+        from visio_people_counter.calibrate import _HINTS, _draw_calibration
+        state = type("S", (), {"mode": None, "line_points": [], "zone_points": [],
+                               "size_points": []})()
+        frame = np.zeros((360, 640, 3), np.uint8)
+        out = _draw_calibration(frame, state, mask_on=False, mask=None,
+                                w=640, h=360)
+        # подсказки (русские) отрисованы белым
+        white = int(((out[..., 0] > 150) & (out[..., 1] > 150)
+                     & (out[..., 2] > 150)).sum())
+        self.assertGreater(white, 200)
+        self.assertIn("[l]иния", _HINTS[None])
 
 
 if __name__ == "__main__":

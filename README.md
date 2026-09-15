@@ -85,18 +85,24 @@ blob'ы, микс с маской движения, линии/зоны счёт
 
 ### 4. Калибровка (`calibrate`)
 
-GUI-режим: рисование линии/зоны/size-точек мышью; результат записывается прямо в
-`config.yaml` (остальные блоки сохраняются), в stdout печатается короткий diff
+GUI-режим: рисование линии/зоны/size-точек мышью; в stdout печатается короткий diff
 «старые → новые координаты».
 
-**Первый запуск без конфига:** если `config.yaml` ещё нет, calibrate стартует с настройками
-по умолчанию (один line-счётчик `main_line`) и создаст файл при сохранении [a].
-Остальные режимы (`count`) требуют существующий конфиг:
+**Куда сохраняется результат [a]:**
+- по умолчанию — рядом с файлом видео: `<имя_видео>.config.yaml`
+  (например, `videos/demo.mp4` → `videos/demo.config.yaml`); для HLS/URL «рядом» не
+  определено — в путь `--config`;
+- если `--config` задан **явно** — результат пишется строго в этот файл.
+
+Входного конфига может не быть: calibrate стартует с настройками по умолчанию (один
+line-счётчик `main_line`). Остальные режимы (`count`, `probe`) требуют существующий конфиг:
 
 ```bash
-.venv/bin/python -m visio_people_counter calibrate --config config.yaml --video videos/demo.mp4
-# другой id счётчика (по умолчанию main_line)
-.venv/bin/python -m visio_people_counter calibrate --config config.yaml --video videos/demo.mp4 --counter-id entry_zone
+# результат → videos/demo.config.yaml; дальше: count --config videos/demo.config.yaml
+.venv/bin/python -m visio_people_counter calibrate --video videos/demo.mp4
+# явный выходной файл + другой id счётчика (по умолчанию main_line)
+.venv/bin/python -m visio_people_counter calibrate --config my_conf.yaml \
+    --video videos/demo.mp4 --counter-id entry_zone
 ```
 
 **Клавиши калибровки:**
