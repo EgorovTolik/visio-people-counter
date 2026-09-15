@@ -3,26 +3,50 @@
 ``python -m visio_people_counter calibrate --config config.yaml
    --video PATH_OR_URL [--counter-id main_line]``
 
-Режимы по клавишам (см. :func:`run_calibration`):
+Режимы по клавишам И кликабельными кнопками в верхней части кадра
+(см. :func:`run_calibration`):
 
-* **l** + 2 клика — линия A→B для выбранного счётчика (порядок кликов = направление «in»);
-* **z** + N кликов, **Enter** — замкнуть полигон зоны (>= 3 точки);
-* **s** + клик (x) + цифра **1..9** (высота человека как % высоты кадра:
-  1=5%, 2=10%, ..., 9=45%), **Enter** — завершить набор size-точек;
-* **m** — toggle показа текущей маски движения (live-подстройка порога);
+* **l** + 2 клика / кнопка «линия» — линия A→B для выбранного счётчика
+  (порядок кликов = направление «in»);
+* **z** + N кликов, **Enter** / кнопка «зона» — замкнуть полигон зоны (>= 3 точки);
+* **s** + клик (x, y) + цифра **1..9** (высота человека как % высоты кадра:
+  1=5%, 2=10%, ..., 9=45%), **Enter** / кнопка «size» — завершить набор size-точек;
+  клик по УЖЕ НАРИСОВАННОЙ size-точке (hit-радиус ~15 px) удаляет её, а
+  **b** / кнопка «−точка» отменяют ПОСЛЕДНЮЮ size-точку;
+* **m** / кнопка «маска» — toggle показа текущей маски движения (live-подстройка порога);
+* **v** / кнопка «все» — toggle режима просмотра ВСЕХ счётчиков из конфига: каждая
+  линия/зона рисуется поверх кадра с размером (линия — длина в px и нормализованная,
+  зона — число углов и доля площади кадра); текущий счётчик выделяется. Чисто
+  визуальный режим — не влияет на apply/delete/seek;
+* **[ ]** / кнопки «<» «>» — предыдущий/следующий счётчик из cfg.counters (циклически,
+  геометрия загружается в окно для правки);
+* **+линия/+зона** — создать новый счётчик (id line_N / zone_N) и перейти к его рисованию;
+* **x** / кнопка «удалить» — удалить текущий счётчик из cfg.counters, очистить его
+  точки в state (чтобы сохранение не «воскресило» счётчик) и переключиться на
+  соседний или новый той же природы;
 * **n/p** — следующий/предыдущий из загруженных кадров;
-* **a** — применить и записать в config.yaml (остальные настройки сохраняются),
-  печатает короткий diff «старые → новые координаты»;
+* **t** / кнопка «время» — seek к заданному времени (секунды, только для файла:
+  набрать цифры 0-9, Enter=OK, ESC/q=отмена; кэш заменяется кадрами после метки,
+  линии/зоны/счётчик не сбрасываются);
+* **a** / кнопка «сохранить» — применить и записать в config.yaml
+  (остальные настройки сохраняются), печатает короткий diff «старые → новые координаты»;
 * **q/ESC** — выход без записи.
 
-Вся логика «клик → обновление конфига» вынесена в чистые функции
-(:class:`CalibrationState`, :func:`click_to_norm`, :func:`size_digit_to_fraction`,
-:func:`apply_calibration`) и тестируется БЕЗ окна (tests/test_gui_calibrate.py).
+Вся логика «клик → обновление конфига», переключение счётчиков и раскладка/hit-test
+кнопок вынесена в чистые функции (:class:`CalibrationState`, :func:`click_to_norm`,
+:func:`size_digit_to_fraction`, :func:`apply_calibration`, :func:`cycle_counter_id`,
+:func:`make_new_counter_id`, :func:`load_counter_into_state`,
+:func:`delete_current_counter`, :func:`layout_buttons`, :func:`hit_button`,
+:func:`size_point_at_click`, :func:`remove_size_point`, :func:`undo_last_size_point`,
+:func:`handle_size_click`)
+и тестируется БЕЗ окна (tests/test_gui_calibrate.py).
 """
 
 from __future__ import annotations
 
+import math
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -37,13 +61,64 @@ from .config import (
     ZoneCounterConfig,
 )
 from .gui import GuiPlayer
-from .text_overlay import put_text
+from .text_overlay import put_text, text_width
 from .motion_detector import MotionDetector
 from .pipeline import Pipeline
-from .video_source import VideoSourceError
+from .video_source import FfmpegPipeSource, VideoSourceError
 
-#: сколько первых кадров видео загрузить для калибровки (для HLS — первые кадры).
-MAX_FRAMES = 20
+#: сколько первых кадров видео загрузить в кэш по умолчанию (для HLS — первые кадры);
+#: переопределяется параметром cache_frames / CLI --cache-frames.
+DEFAULT_CACHE_FRAMES = 100
+
+#: как долго красные сообщения-уведомления держатся на экране.
+MESSAGE_TTL_SECONDS = 5.0
+
+#: hit-радиус (в px ЭКРАНА) клика по существующей size-точке в режиме «размер»:
+#: клик ближе, чем на этот радиус ПО ОБЕИМ осям (x и y), — точка удаляется.
+SIZE_POINT_HIT_RADIUS_PX = 15
+
+
+def clamp_seek_time(requested_s: float, duration_s: float,
+                    cache_frames: int, fps: float) -> tuple[float, bool]:
+    """Запрос seek ограничить так, чтобы после метки оставалось место на ``cache_frames``.
+
+    :returns: ``(time_s, clamped)``. Если длительность/fps неизвестны (<= 0) — время не меняется;
+        если и «конец минус cache-кадров» <= 0 — ставится 0.0.
+    """
+    if duration_s <= 0 or fps <= 0 or cache_frames <= 0:
+        return requested_s, False
+    max_t = max(0.0, duration_s - cache_frames / float(fps))
+    if requested_s > max_t:
+        return max_t, True
+    return requested_s, False
+
+
+def filter_expired_messages(messages: list[tuple[str, float]],
+                            now: float) -> list[tuple[str, float]]:
+    """Отбросить уведомления с истёкшим сроком ``(message, expires_at)`` (чистая функция)."""
+    return [m for m in messages if m[1] > now]
+
+
+def draw_notification(img: np.ndarray, text: str, x: int, y: int,
+                      size_px: int = 14, color=(0, 0, 255)) -> None:
+    """Уведомление: одноцветная скруглённая подложка + текст БЕЗ тени (читаемость)."""
+    if img is None or img.size == 0 or not text:
+        return
+    pad = 5
+    tw = text_width(text, size_px)
+    x0, y0 = x - pad, y - pad
+    x1, y1 = x + tw + pad, y + size_px + pad
+    # не вылезать за кадр
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(img.shape[1] - 1, x1), min(img.shape[0] - 1, y1)
+    bg = (255, 255, 255)
+    if hasattr(cv2, "roundedRect"):
+        cv2.roundedRect(img, (x0, y0), (x1, y1), max(2, size_px // 3), -1,
+                        color=bg, lineType=cv2.LINE_AA)
+    else:  # pragma: no cover
+        cv2.rectangle(img, (x0, y0), (x1, y1), bg, -1)
+    put_text(img, text, (max(0, x), max(0, y)), size_px=size_px, color=color,
+             shadow=False)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +147,44 @@ def size_digit_to_fraction(digit: int) -> float:
     return round(0.05 * digit, 2)
 
 
+#: максимальное число знаков в буфере ввода времени (seek-секунды).
+TIME_INPUT_MAX_DIGITS = 6
+
+
+@dataclass
+class TimeInputBuffer:
+    """Буфер ввода времени для seek (чистый класс — без cv2/окна).
+
+    Цифры набираются в конец (лимит :data:`TIME_INPUT_MAX_DIGITS` знаков,
+    лишние игнорируются), backspace удаляет последний знак.
+    """
+
+    digits: list[int] = field(default_factory=list)
+
+    def feed_digit(self, d: int) -> None:
+        """Добавить цифру 0..9 в конец; при лимите знаков — игнорировать.
+
+        :raises ValueError: d не целое 0..9.
+        """
+        if not isinstance(d, int) or isinstance(d, bool) or not (0 <= d <= 9):
+            raise ValueError(f"цифра времени: ожидалось int 0..9, получено {d!r}")
+        if len(self.digits) < TIME_INPUT_MAX_DIGITS:
+            self.digits.append(d)
+
+    def backspace(self) -> None:
+        """Удалить последний знак (пустой буфер — без изменений)."""
+        if self.digits:
+            self.digits.pop()
+
+    def value(self) -> Optional[int]:
+        """Набранное время в секундах (int); пустой буфер → None."""
+        return int("".join(str(d) for d in self.digits)) if self.digits else None
+
+    def reset(self) -> None:
+        """Очистить буфер."""
+        self.digits = []
+
+
 @dataclass
 class CalibrationState:
     """Собранное в окне калибровки (чистое состояние — без cv2)."""
@@ -80,8 +193,9 @@ class CalibrationState:
     mode: Optional[str] = None   # "line" | "zone" | "size" | None
     line_points: list[tuple[float, float]] = field(default_factory=list)   # норм. (x, y)
     zone_points: list[tuple[float, float]] = field(default_factory=list)   # норм. (x, y)
-    size_points: list[tuple[float, float]] = field(default_factory=list)   # [x_frac, h_frac]
+    size_points: list[tuple[float, float, float]] = field(default_factory=list)  # [x_frac, y_frac, h_frac]
     _size_x: Optional[float] = None  # x последней 's'-точки, ждёт цифру
+    _size_y: Optional[float] = None  # y последней 's'-точки, ждёт цифру
 
     def set_mode(self, mode: str) -> None:
         """Переключить режим ('l'/'z'/'s'); переключение очищает НОВЫЙ набор."""
@@ -95,6 +209,7 @@ class CalibrationState:
             self.zone_points = []
             self.line_points = []
             self._size_x = None
+            self._size_y = None
         else:  # size: точки накапливаются до Enter
             pass
 
@@ -107,14 +222,18 @@ class CalibrationState:
         elif self.mode == "zone":
             self.zone_points.append((x_norm, y_norm))
         elif self.mode == "size":
-            self._size_x = x_norm      # высоту задаст следующая цифра 1..9
+            # высоту задаст следующая цифра 1..9; важны ОБЕ координаты (2D-профиль)
+            self._size_x = x_norm
+            self._size_y = y_norm
 
     def set_size_height(self, digit: int) -> None:
-        """Цифра 1..9 в режиме 's': фиксирует высоту точки (x — из клика)."""
-        if self.mode != "size" or self._size_x is None:
+        """Цифра 1..9 в режиме 's': фиксирует высоту точки (x и y — из клика)."""
+        if self.mode != "size" or self._size_x is None or self._size_y is None:
             return
-        self.size_points.append((self._size_x, size_digit_to_fraction(digit)))
+        self.size_points.append((self._size_x, self._size_y,
+                                 size_digit_to_fraction(digit)))
         self._size_x = None
+        self._size_y = None
 
     def finish_zone(self) -> list[tuple[float, float]]:
         """Enter в режиме 'z': закрыть полигон. :raises ValueError: < 3 точек."""
@@ -126,6 +245,70 @@ class CalibrationState:
     def finish_size(self) -> None:
         """Enter в режиме 's': завершить набор size-точек."""
         self._size_x = None
+        self._size_y = None
+
+
+def size_point_at_click(size_points, x_px: int, y_px: int, w: int, h: int,
+                        radius_px: int = SIZE_POINT_HIT_RADIUS_PX) -> Optional[int]:
+    """Индекс существующей size-точки под пиксельным кликом (x_px, y_px) или None.
+
+    Сравнение в пикселях ЭКРАНА: точка считается «попавшей», если
+    ``|x_px − x_frac·w| ≤ radius_px`` И ``|y_px − y_frac·h| ≤ radius_px`` —
+    радиус фиксирован на экране, поэтому на широком/высоком кадре он работает
+    так же, как и на узком. Возвращает индекс ПЕРВОЙ подходящей точки.
+    Пустой список / некорректный размер кадра → None (без исключений).
+    """
+    if w <= 0 or h <= 0:
+        return None
+    for i, (x_f, y_f, _h_f) in enumerate(size_points):
+        if abs(x_px - x_f * w) <= radius_px and abs(y_px - y_f * h) <= radius_px:
+            return i
+    return None
+
+
+def remove_size_point(state: CalibrationState,
+                      index: int) -> Optional[tuple]:
+    """Удалить size-точку по индексу (чистая функция); вернуть удалённую точку.
+
+    Пустой список или индекс вне 0..len-1 → None, state не меняется.
+    """
+    if not 0 <= index < len(state.size_points):
+        return None
+    return state.size_points.pop(index)
+
+
+def undo_last_size_point(state: CalibrationState) -> Optional[tuple]:
+    """Отменить ПОСЛЕДНЮЮ size-точку (клавиша [b] / кнопка «−точка»).
+
+    Возвращает удалённую точку ``[x, y, h]``; пустой список → None (без падений).
+    Ожидающая цифру точка (``_size_x/_size_y``) при этом не трогается.
+    """
+    if not state.size_points:
+        return None
+    return state.size_points.pop()
+
+
+def handle_size_click(state: CalibrationState, x_px: int, y_px: int,
+                      w: int, h: int,
+                      radius_px: int = SIZE_POINT_HIT_RADIUS_PX) -> Optional[tuple]:
+    """Клик в режиме «размер» (координаты в px экрана) — чистая функция.
+
+    * клик попал по существующей size-точке (:func:`size_point_at_click`) →
+      удалить её и вернуть удалённую точку;
+    * иначе — обычный клик: запомнить новую ожидающую цифру точку
+      (:meth:`CalibrationState.handle_click`), вернуть None.
+
+    Hit-логика удаления активна ТОЛЬКО в режиме «размер»: в других режимах
+    клик просто передаётся в :meth:`CalibrationState.handle_click`
+    (size-точки не конфликтуют с точками линии/зоны).
+    """
+    if state.mode == "size":
+        idx = size_point_at_click(state.size_points, x_px, y_px, w, h,
+                                  radius_px=radius_px)
+        if idx is not None:
+            return remove_size_point(state, idx)
+    state.handle_click(*click_to_norm(x_px, y_px, w, h))
+    return None
 
 
 def _find_counter(cfg: Config, counter_id: str, ctype):
@@ -141,7 +324,8 @@ def apply_calibration(cfg: Config, state: CalibrationState) -> list[str]:
     * линия (2 точки): обновляет a/b существующего line-счётчика с id
       ``state.counter_id``; если такого счётчика нет — добавляет новый;
     * зона (>= 3 точек после Enter-логике): то же для zone-счётчика;
-    * size-точки: ``size_profile.control_points`` + ``enabled=True``.
+    * size-точки: ``size_profile.control_points`` (тройки ``[x, y, h]``) +
+      ``enabled=True``.
 
     :returns: список коротких строк diff «старое → новое» (пусто — нечего применить).
     """
@@ -188,16 +372,349 @@ def _fmt_pt(p: tuple[float, float]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Мульти-счётчики и кнопки (чистые функции — тестируются без окна)
+# ---------------------------------------------------------------------------
+
+#: Кнопка: (name, label, active, x0, y0, x1, y1) — name для hit-test/действий,
+#: label — русский текст на кнопке, координаты в px кадра (включительно x0/y0,
+#: не включительно x1/y1).
+Button = tuple[str, str, bool, int, int, int, int]
+
+
+def cycle_counter_id(ids: list[str], current: Optional[str], direction: int) -> str:
+    """Следующий/предыдущий счётчик из списка id (циклически).
+
+    :param ids: id всех счётчиков из cfg.counters, в порядке конфига.
+    :param current: текущий id; может не быть в ``ids`` (новый, ещё не сохранённый счётчик).
+    :param direction: +1 — следующий, -1 — предыдущий.
+    :raises ValueError: пустой список или направление не ±1.
+    """
+    if not ids:
+        raise ValueError("нет счётчиков — создайте новый кнопкой +линия/+зона")
+    if direction not in (-1, 1):
+        raise ValueError(f"направление: ожидалось -1 или 1, получено {direction!r}")
+    if current in ids:
+        i = (ids.index(current) + direction) % len(ids)
+    else:
+        # новый счётчик ещё не в конфиге — «вперёд» ведёт к первому, «назад» — к последнему
+        i = 0 if direction > 0 else len(ids) - 1
+    return ids[i]
+
+
+def make_new_counter_id(existing_ids, kind: str) -> str:
+    """Уникальный id нового счётчика: ``line_1``, ``line_2``… / ``zone_1``, …
+
+    n — минимальный свободный номер среди ВСЕХ существующих id (не только по
+    префиксу): например, при занятых {"line_1", "line_3"} вернёт "line_2".
+    :raises ValueError: kind не line/zone.
+    """
+    if kind not in ("line", "zone"):
+        raise ValueError(f"тип счётчика: ожидалось line/zone, получено {kind!r}")
+    taken = set(existing_ids)
+    n = 1
+    while f"{kind}_{n}" in taken:
+        n += 1
+    return f"{kind}_{n}"
+
+
+def load_counter_into_state(state: CalibrationState, counter) -> None:
+    """Загрузить геометрию существующего счётчика в :class:`CalibrationState` для правки.
+
+    line → mode="line", line_points=[a, b]; zone → mode="zone", zone_points=polygon.
+    Точки другого типа очищаются. size-точки общие (не зависят от счётчика) — не трогаются.
+    :raises ValueError: неизвестный тип объекта counter.
+    """
+    if not isinstance(counter, (LineCounterConfig, ZoneCounterConfig)):
+        raise ValueError(f"тип счётчика: ожидалось Line/ZoneCounterConfig, получено {type(counter).__name__!r}")
+    state.counter_id = counter.id
+    if isinstance(counter, LineCounterConfig):
+        state.mode = "line"
+        state.line_points = [tuple(counter.a), tuple(counter.b)]
+        state.zone_points = []
+    else:
+        state.mode = "zone"
+        state.zone_points = [tuple(p) for p in counter.polygon]
+        state.line_points = []
+    state._size_x = None
+    state._size_y = None
+
+
+def delete_current_counter(cfg: Config, state: CalibrationState) -> str:
+    """Удалить текущий счётчик (``state.counter_id``) — чистая функция, без cv2/окна.
+
+    In-place меняет и ``cfg``, и ``state``:
+
+    * если id есть в ``cfg.counters`` — убрать его из списка;
+    * очистить в state собранные точки этого счётчика, чтобы :func:`apply_calibration`
+      не «воскресил» его при сохранении: line-счётчик (или mode=="line") →
+      ``state.line_points = []``, zone (или mode=="zone") → ``state.zone_points = []``;
+      если счётчика ещё нет в cfg и mode неизвестен — оба набора точек очищаются;
+    * после удаления переключиться: если в ``cfg.counters`` остались счётчики —
+      как «назад» (:func:`cycle_counter_id` с direction=-1) с загрузкой его геометрии
+      в state; если не осталось — автоматически создать новый pending-счётчик той же
+      природы (линия → line, зона → zone; по умолчанию line), чтобы продолжить работу.
+
+    :returns: сообщение для пользователя: ``счётчик <id> удалён``.
+    """
+    cid = state.counter_id
+    removed_kind: Optional[str] = None
+    for i, c in enumerate(cfg.counters):
+        if c.id == cid:
+            removed_kind = ("line" if isinstance(c, LineCounterConfig)
+                            else "zone")
+            cfg.counters.pop(i)
+            break
+
+    # очищаем точки удалённого счётчика — иначе apply_calibration пересоздал бы его
+    if removed_kind == "line":
+        state.line_points = []
+    elif removed_kind == "zone":
+        state.zone_points = []
+    else:
+        # неприменённый «новый»: ориентируемся на текущий mode (иначе — оба набора)
+        if state.mode == "line":
+            state.line_points = []
+        elif state.mode == "zone":
+            state.zone_points = []
+        else:
+            state.line_points = []
+            state.zone_points = []
+
+    if cfg.counters:
+        # «назад» относительно удалённого id: его уже нет в списке → последний
+        new_id = cycle_counter_id([c.id for c in cfg.counters], cid, -1)
+        counter = next(c for c in cfg.counters if c.id == new_id)
+        load_counter_into_state(state, counter)
+    else:
+        kind = removed_kind or (state.mode if state.mode in ("line", "zone")
+                                else "line")
+        state.counter_id = make_new_counter_id({c.id for c in cfg.counters}, kind)
+        state.set_mode(kind)
+
+    return f"счётчик {cid} удалён"
+
+
+# ---------------------------------------------------------------------------
+# Режим «все»: все счётчики из конфига с размерами (чистые функции, без окна)
+# ---------------------------------------------------------------------------
+
+#: палитра цветов (BGR) режима «все» — выбирается по индексу счётчика в cfg.counters.
+#: Небольшая (4 цвета), контрастная и к тому же читаемая текстом на белой подложке
+#: меток (draw_notification).
+_SHOW_ALL_PALETTE = [
+    (255, 140, 0),    # оранжевый
+    (230, 0, 230),    # пурпурный
+    (200, 100, 0),    # синий
+    (210, 210, 0),    # жёлтый
+]
+
+#: цвет/стиль ТЕКУЩЕГО (редактируемого) счётчика в режиме «все»: тот же зелёный,
+#: что и у редактируемой линии/зоны (не дублируется криво — совпадает с ней),
+#: но толще.
+_SHOW_ALL_HIGHLIGHT_COLOR = (0, 255, 0)
+
+
+def line_length_norm(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Нормализованная длина линии (евклидова по долям кадра, БЕЗ aspect ratio).
+
+    ``sqrt((bx-ax)² + (by-ay)²)`` — координаты a/b уже в долях 0..1.
+    """
+    return math.hypot(b[0] - a[0], b[1] - a[1])
+
+
+def line_length_px(a: tuple[float, float], b: tuple[float, float],
+                   w: int, h: int) -> float:
+    """Длина линии в пикселях кадра ``w``x``h``: ``sqrt((dx*w)² + (dy*h)²)``."""
+    return math.hypot((b[0] - a[0]) * w, (b[1] - a[1]) * h)
+
+
+def polygon_area_fraction(polygon, w: int, h: int) -> float:
+    """Доля площади полигона от кадра: ``cv2.contourArea`` в px / ``(w*h)``.
+
+    Пустой, вырожденный (< 3 точек / коллинеарные) полигон или некорректный
+    размер кадра → ``0.0``.
+    """
+    if not polygon or w <= 0 or h <= 0:
+        return 0.0
+    pts = np.array([(int(round(x * w)), int(round(y * h))) for x, y in polygon],
+                   dtype=np.int32)
+    if len(pts) < 3:
+        return 0.0
+    return float(cv2.contourArea(pts)) / float(w * h)
+
+
+def draw_all_counters(img: np.ndarray, counters, w: int, h: int,
+                      highlight_id: Optional[str] = None) -> None:
+    """Режим «все»: нарисовать ВСЕ счётчики из конфига поверх кадра (in-place).
+
+    * line — отрезок A→B + точки; у середины метка
+      ``{id}: {длина_px}px ({длина_norm:.3f})``;
+    * zone — замкнутый контур полигона + вершины; у центроида метка
+      ``{id}: {N} угл., S={доля_площади:.1%} кадра``.
+
+    Цвет — палитра :data:`_SHOW_ALL_PALETTE` по индексу счётчика; текущий
+    счётчик (``highlight_id``, как правило ``state.counter_id``) рисуется тем же
+    зелёным, что и редактируемая линия/зона, но толще, с пометкой «(текущий)».
+    Метки — через :func:`draw_notification` (put_text, кириллица).
+    Пустой список счётчиков / нулевой кадр — без изменений, без ошибок.
+    """
+    if img is None or img.size == 0 or not counters:
+        return
+
+    def px(p: tuple[float, float]) -> tuple[int, int]:
+        return (int(round(p[0] * w)), int(round(p[1] * h)))
+
+    for i, c in enumerate(counters):
+        is_current = highlight_id is not None and getattr(c, "id", "") == highlight_id
+        color = _SHOW_ALL_HIGHLIGHT_COLOR if is_current else \
+            _SHOW_ALL_PALETTE[i % len(_SHOW_ALL_PALETTE)]
+        thickness = 4 if is_current else 2
+
+        if isinstance(c, LineCounterConfig):
+            pa, pb = px(c.a), px(c.b)
+            cv2.line(img, pa, pb, color, thickness, lineType=cv2.LINE_AA)
+            for p in (pa, pb):
+                cv2.circle(img, p, 4, color, -1)
+            anchor = ((pa[0] + pb[0]) // 2, (pa[1] + pb[1]) // 2)
+            label = (f"{c.id}: {line_length_px(c.a, c.b, w, h):.0f}px "
+                     f"({line_length_norm(c.a, c.b):.3f})")
+        elif isinstance(c, ZoneCounterConfig) and len(c.polygon) >= 2:
+            pts = np.array([px(p) for p in c.polygon], dtype=np.int32)
+            cv2.polylines(img, [pts], True, color, thickness, lineType=cv2.LINE_AA)
+            for p in pts:
+                cv2.circle(img, (int(p[0]), int(p[1])), 3, color, -1)
+            m = cv2.moments(pts)   # центроид; фолбэк — среднее вершин
+            if m["m00"] > 0:
+                anchor = (int(m["m10"] / m["m00"]), int(m["m01"] / m["m00"]))
+            else:
+                cx, cy = pts.mean(axis=0)
+                anchor = (int(cx), int(cy))
+            label = (f"{c.id}: {len(c.polygon)} угл., "
+                     f"S={polygon_area_fraction(c.polygon, w, h):.1%} кадра")
+        else:
+            continue   # зона без полигона — нечего рисовать
+
+        if is_current:
+            label += " (текущий)"
+        size = 14
+        tw = text_width(label, size)
+        lx = min(max(4, anchor[0] - tw // 2), max(4, img.shape[1] - tw - 4))
+        ly = min(max(4, anchor[1] - 20), img.shape[0] - 26)
+        draw_notification(img, label, x=lx, y=ly, size_px=size, color=color)
+
+
+def counter_status_text(counter_id: str, counters) -> str:
+    """Строка статуса над кнопками: текущий счётчик и его позиция в списке."""
+    if not counters:
+        return "Счётчиков нет — нажмите кнопку +линия или +зона"
+    ids = [c.id for c in counters]
+    n = len(ids)
+    if counter_id in ids:
+        i = ids.index(counter_id)
+        c = counters[i]
+        kind = "линия" if isinstance(c, LineCounterConfig) else "зона"
+        return f"Счётчик: {counter_id} ({kind}, позиция {i + 1} из {n})"
+    return f"Счётчик: {counter_id} (новый — появится в конфиге после [a])"
+
+
+#: Порядок и подписи кнопок панели (слева направо); name — ключ действия.
+_BUTTON_LABELS: list[tuple[str, str]] = [
+    ("line", "линия"),
+    ("zone", "зона"),
+    ("size", "размер"),
+    ("mask", "маска"),
+    ("show_all", "все"),
+    ("prev", "<"),
+    ("next", ">"),
+    ("new_line", "+линия"),
+    ("new_zone", "+зона"),
+    ("delete", "удалить"),
+    ("undo_size", "−точка"),
+    ("time", "время"),
+    ("save", "сохранить"),
+]
+
+#: высота строки кнопки в px: шрифт + отступы сверху/снизу
+BUTTON_PAD = 6
+#: вертикальный зазор между соседними кнопками
+_BUTTON_GAP = 4
+
+
+def layout_buttons(mode: Optional[str], mask_on: bool, *, show_all: bool = False,
+                   x0: int = 8, y0: int = 34, font_px: int = 20) -> list[Button]:
+    """Раскладка строки кнопок панели (чистая функция, ширина текста — text_width).
+
+    :returns: список ``(name, label, active, x0, y0, x1, y1)`` слева направо.
+        Активны кнопки текущего режима (линия/зона/size), маска при mask_on и
+        «все» при show_all; остальные — неактивны (они «моментальные» действия).
+    """
+    active_map = {"line": mode == "line", "zone": mode == "zone",
+                  "size": mode == "size", "mask": bool(mask_on),
+                  "show_all": bool(show_all)}
+    out: list[Button] = []
+    x = x0
+    for name, label in _BUTTON_LABELS:
+        tw = text_width(label, font_px) + 2 * BUTTON_PAD
+        active = active_map.get(name, False)
+        out.append((name, label, active, x, y0, x + tw, y0 + font_px + 2 * BUTTON_PAD))
+        x += tw + _BUTTON_GAP
+    return out
+
+
+def hit_button(buttons: list[Button], x: int, y: int) -> Optional[str]:
+    """Название кнопки под точкой (x, y) или None — клик мимо всех кнопок.
+
+    Кнопки не пересекаются и лежат только в верхней панели, поэтому клик ниже
+    панели автоматически промахивается (не перехватывает рисование линии/зоны).
+    """
+    for name, _label, _active, bx0, by0, bx1, by1 in buttons:
+        if bx0 <= x < bx1 and by0 <= y < by1:
+            return name
+    return None
+
+
+def draw_top_panel(img: np.ndarray, counter_id: str, counters,
+                   mode: Optional[str], mask_on: bool,
+                   show_all: bool = False) -> list[Button]:
+    """Нарисовать вверху кадра статусную строку + панель кнопок; вернуть раскладку
+    для hit-test в mouse-callback. Текст — только через put_text (кириллица)."""
+    put_text(img, counter_status_text(counter_id, counters), (10, 8), size_px=20,
+             color=(255, 255, 255))
+    font = 20
+    buttons = layout_buttons(mode, mask_on, show_all=show_all, font_px=font)
+    # узкий кадр: сужаем шрифт кнопок (не ниже 12px), чтобы вся строка помещалась
+    while buttons and buttons[-1][5] > img.shape[1] - 4 and font > 12:
+        font -= 2
+        buttons = layout_buttons(mode, mask_on, show_all=show_all, font_px=font)
+    for _name, label, active, bx0, by0, bx1, by1 in buttons:
+        fill = (0, 128, 0) if active else (60, 60, 60)
+        cv2.rectangle(img, (bx0, by0), (bx1, by1), fill, -1)
+        tw = text_width(label, font)
+        tx = bx0 + max(0, ((bx1 - bx0) - tw) // 2)   # текст по центру кнопки
+        put_text(img, label, (tx, by0 + BUTTON_PAD), size_px=font,
+                 color=(255, 255, 255))
+    return buttons
+
+
+# ---------------------------------------------------------------------------
 # Интерактивный цикл (окно — только здесь)
 # ---------------------------------------------------------------------------
 
 #: Подсказки на экране (рисуются через text_overlay.put_text — кириллица поддерживается).
 _HINTS = {
-    None: "режимы: [l]иния 2 клика | [z]она N кликов+Enter | [s]ize точка+цифра 1-9\n"
-          "[m]аска движения | [n/p] кадр вперёд/назад | [a]применить и сохранить | [q]выход",
-    "line": "ЛИНИЯ: кликните точку A, затем B (порядок = направление in); повторный 'l' — заново",
-    "zone": "ЗОНА: кликайте углы полигона; Enter — замкнуть (>=3), 'z' — начать заново",
-    "size": "SIZE: кликните X-точку, затем цифру 1-9 (1=5% ... 9=45% высоты кадра); Enter — завершить",
+    None: ("режимы: кнопки или клавиши — [l]иния 2 клика | [z]она N кликов+Enter "
+           "| [s]ize точка (x,y)+цифра 1-9\n"
+           "счётчики: кнопки [<]/[>] (или клавиши [ ]) — смена | +линия/+зона — новый счётчик "
+           "| удалить/[x] — удалить текущий счётчик\n"
+           "| [m]аска движения | [v]се — все счётчики с размерами | [n/p] кадр вперёд/назад "
+           "| [t]время (seek, только файл) | [a]сохранить | [q]выход"),
+    "line": ("ЛИНИЯ: кликните точку A, затем B (порядок = направление in); "
+             "повторный 'l' или кнопка «линия» — заново"),
+    "zone": ("ЗОНА: кликайте углы полигона; Enter — замкнуть (>=3), "
+             "'z'/кнопка «зона» — начать заново"),
+    "size": ("SIZE: кликните точку, где стоит человек (важен и x, и y), "
+             "затем цифру 1-9 (1=5% ... 9=45% высоты кадра); Enter — завершить\n"
+             "клик по существующей точке — удалить её; [b]/кнопка «−точка» — отменить последнюю"),
 }
 
 
@@ -231,21 +748,24 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
             cv2.polylines(img, [np.array(pts, dtype=np.int32)], False,
                           (0, 200, 255), 2, lineType=cv2.LINE_AA)
 
-    for x_f, h_f in state.size_points:
-        # size-точка = (x_frac, доля высоты человека): вертикальный отрезок
-        # нужной длины, центрированный по y=1/2 кадра
+    for x_f, y_f, h_f in state.size_points:
+        # size-точка = (x_frac, y_frac, доля высоты человека): вертикальный
+        # отрезок нужной длины в точке клика (x, y) — «человек» стоит именно там
         x = int(round(x_f * w))
-        yc = h // 2
+        yc = max(0, min(h - 1, int(round(y_f * h))))
         seg_h = int(round(h_f * h))
-        cv2.line(img, (x, yc - seg_h // 2), (x, yc + seg_h // 2), (0, 255, 255), 2)
-        cv2.putText(img, f"{int(round(h_f * 100))}%", (x + 6, yc),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+        top = max(0, yc - seg_h // 2)
+        bottom = min(h - 1, yc + seg_h // 2)
+        cv2.line(img, (x, top), (x, bottom), (0, 255, 255), 2)
+        put_text(img, f"{int(round(h_f * 100))}%", (x + 6, max(4, yc - 8)),
+                 size_px=14, color=(0, 255, 255))
 
-    # подсказки сверху
-    y = 10
-    for line in _HINTS[state.mode].split("\n"):
-        put_text(img, line, (10, y), size_px=16, color=(255, 255, 255))
-        y += 24
+    # подсказки внизу кадра (верх занят статусной строкой + панелью кнопок)
+    hint_lines = _HINTS[state.mode].split("\n")
+    y = h - 18 - 22 * len(hint_lines)
+    for line in hint_lines:
+        put_text(img, line, (10, max(4, y)), size_px=16, color=(255, 255, 255))
+        y += 22
     return img
 
 
@@ -265,13 +785,18 @@ def calibration_save_target(video_type: str, video_path: str,
 def run_calibration(config_path: str | Path, video: Optional[str] = None,
                     counter_id: str = "main_line",
                     window_name: str = "calibrate [l/z/s/m/a/q]",
-                    save_to: Optional[str | Path] = None) -> int:
+                    save_to: Optional[str | Path] = None,
+                    cache_frames: int = DEFAULT_CACHE_FRAMES) -> int:
     """Интерактивная калибровка.
 
     :param save_to: если задан (например, явный --config) — результат пишется строго туда;
         иначе по умолчанию рядом с видео: ``<имя_видео>.config.yaml``.
+    :param cache_frames: сколько кадров держать в кэше листа ([n/p]) и после seek
+        (клавиша [t]/кнопка «время», только для файла); по умолчанию 100.
     :returns: 0 — корректное завершение (запись опциональна).
     """
+    if cache_frames < 1:
+        raise ValueError(f"cache_frames: ожидалось >= 1, получено {cache_frames!r}")
     if not GuiPlayer.available():
         print(f"calibrate: ОШИБКА: {GuiPlayer.unavailable_reason()}", file=sys.stderr)
         return 1
@@ -320,94 +845,283 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
     detector = MotionDetector(cfg)   # для 'm' — live-маска движения
     frames: list[np.ndarray] = []
     masks: list[Optional[np.ndarray]] = []
-    try:
-        while len(frames) < MAX_FRAMES:
+
+    def _load_cache() -> int:
+        """Загрузить до cache_frames кадров от ТЕКУЩЕЙ позиции источника с масками;
+        ЗАМЕНЯЕТ списки frames/masks. Возвращает число загруженных кадров."""
+        frames.clear()
+        masks.clear()
+        while len(frames) < cache_frames:
             fr = pipe.source.read()
             if fr is None:
                 break
             detector.detect(fr.image)
             frames.append(fr.image.copy())
             masks.append(getattr(detector, "last_mask", None))
-    finally:
-        # кадры уже загружены — источник больше не нужен
-        pipe.close()
+        return len(frames)
 
-    if not frames:
-        print("calibrate: ОШИБКА: не удалось прочитать ни одного кадра", file=sys.stderr)
-        return 1
-    print(f"calibrate: загрузил {len(frames)} кадр(ов) {w}x{h}, counter-id={counter_id!r}; "
-          f"[n/p] — листать, [a] — сохранить в {config_path}")
+    # seek (клавиша [t]/кнопка «время») возможен только для файла: у ffmpeg-пайпа
+    # (HLS/URL) случайного доступа нет — базовый VideoSource.seek() возвращает False.
+    seek_supported = not isinstance(pipe.source, FfmpegPipeSource)
+    time_buf = TimeInputBuffer()
+    time_input_active = False   # режим ввода времени (переключается в цикле окна)
 
     state = CalibrationState(counter_id=counter_id)
     mask_on = False
+    show_all = False   # режим «все»: показать все счётчики из конфига с размерами (только визуал)
     idx = 0
     saved_once = False
-    pending_msgs: list[str] = []
+    pending_msgs: list[tuple[str, float]] = []  # (текст, expires_at — time.monotonic)
+    buttons: list[Button] = []   # раскладка панели (обновляется каждый кадр отрисовкой)
+
+    def _notify(msg: str) -> None:
+        """Сообщение на экране: живёт MESSAGE_TTL_SECONDS секунд."""
+        pending_msgs.append((msg, time.monotonic() + MESSAGE_TTL_SECONDS))
+
+    def _begin_time_input() -> None:
+        """[t]/кнопка «время» — включить режим ввода времени для seek.
+
+        Для HLS/URL (нет случайного доступа) режим НЕ включается — только уведомление;
+        повторное нажатие при открытом режиме ничего не делает (не дублирует).
+        Собранные линии/зоны/счётчик при этом не трогаются.
+        """
+        nonlocal time_input_active
+        if time_input_active:
+            return
+        if not seek_supported:
+            _notify("seek недоступен для HLS/URL — только файл видео")
+            return
+        time_buf.reset()
+        time_input_active = True
+        _notify(f"Время (сек): наберите цифры 0-9 | Enter=OK, ESC/q=отмена")
+
+    def _apply_time_seek() -> None:
+        """Enter в режиме ввода: source.seek(N) и замена кэша кадрами после метки.
+
+        State (линии/зоны/sizes/текущий счётчик) НЕ сбрасывается — только кэш кадров.
+        Если после метки нет ни одного кадра — возврат в начало, чтобы окно не осталось
+        без кадров.
+        """
+        nonlocal idx, time_input_active
+        v = time_buf.value()
+        if v is None:
+            _notify("время не задано — наберите цифры 0-9")
+            return
+        # время больше длительности файла → конец минус cache_frames (иначе cv2 уйдёт в начало)
+        t_seek, clamped = clamp_seek_time(float(v), getattr(pipe.source, "duration", 0.0),
+                                          cache_frames, pipe.source.fps)
+        if clamped:
+            _notify(f"время {v} с больше длительности файла — seek к {t_seek:.1f} с "
+                    f"(конец − {cache_frames} кадр(ов))")
+        if not pipe.source.seek(t_seek):
+            time_input_active = False
+            _notify("seek недоступен для HLS/URL — только файл видео")
+            return
+        n_loaded = _load_cache()   # читает от новой метки, ЗАМЕНЯЕТ frames/masks
+        idx = 0
+        time_input_active = False
+        if n_loaded == 0:
+            pipe.source.seek(0.0)
+            _load_cache()
+            _notify(f"seek к {v} c: после метки нет кадров — вернулся в начало")
+        else:
+            _notify(f"seek к {v} c: загружено {n_loaded} кадр(ов)")
+
+    def _switch_counter(direction: int) -> None:
+        """[<]/[>]/[ ] — переключение счётчика с загрузкой его геометрии."""
+        try:
+            new_id = cycle_counter_id([c.id for c in cfg.counters],
+                                      state.counter_id, direction)
+            counter = next(c for c in cfg.counters if c.id == new_id)
+            load_counter_into_state(state, counter)
+            _notify(f"счётчик: {new_id} (геометрия загружена для правки)")
+        except ValueError as e:
+            _notify(str(e))
+
+    def _new_counter(kind: str) -> None:
+        """+линия/+зона — новый счётчик (в cfg попадёт при [a])."""
+        new_id = make_new_counter_id({c.id for c in cfg.counters}, kind)
+        state.counter_id = new_id
+        state.set_mode("line" if kind == "line" else "zone")   # пустые точки, нужный режим
+        _notify(f"новый счётчик {new_id} — нарисуйте {'линию' if kind == 'line' else 'зону'}, "
+                f"[a] сохранит в конфиг")
+
+    def _do_delete() -> None:
+        """удалить/x — удалить текущий счётчик (логика в delete_current_counter)."""
+        msg = delete_current_counter(cfg, state)
+        _notify(msg)
+        print(f"calibrate: {msg}")
+
+    def _do_undo_size_point() -> None:
+        """[b]/кнопка «−точка» — отменить последнюю size-точку.
+
+        Работает осмысленно только в режиме «размер»: из других режимов
+        точки НЕ удаляются, а выдаётся подсказка включить режим размер.
+        """
+        if state.mode != "size":
+            _notify("−точка: включите режим размер (клавиша s / кнопка «размер»)")
+            return
+        pt = undo_last_size_point(state)
+        if pt is None:
+            _notify("размер: точек нет")
+        else:
+            _notify(f"размер: последняя точка отменена (x={pt[0]:.3f}, "
+                    f"y={pt[1]:.3f}, h={int(round(pt[2] * 100))}%)")
+
+    def _do_save() -> None:
+        nonlocal saved_once
+        try:
+            changed = apply_calibration(cfg, state)
+            if not changed:
+                _notify("ничего не менялось — нет собранных линий/зон/size-точек")
+            else:
+                Config.save(cfg, save_target)
+                saved_once = True
+                print(f"calibrate: сохранено в {save_target}:")
+                for line in changed:
+                    print(f"  - {line}")
+                print(f"calibrate: дальше — "
+                      f".venv/bin/python -m visio_people_counter count --config {save_target}")
+        except (ConfigError, OSError) as e:
+            _notify(f"ошибка записи: {e}")
+
+    def _do_button(name: str) -> None:
+        nonlocal mask_on, show_all
+        if name == "line":
+            state.set_mode("line")
+        elif name == "zone":
+            state.set_mode("zone")
+        elif name == "size":
+            state.set_mode("size")
+        elif name == "mask":
+            mask_on = not mask_on
+        elif name == "show_all":
+            show_all = not show_all
+        elif name == "prev":
+            _switch_counter(-1)
+        elif name == "next":
+            _switch_counter(1)
+        elif name == "new_line":
+            _new_counter("line")
+        elif name == "new_zone":
+            _new_counter("zone")
+        elif name == "delete":
+            _do_delete()
+        elif name == "undo_size":
+            _do_undo_size_point()
+        elif name == "time":
+            _begin_time_input()
+        elif name == "save":
+            _do_save()
 
     def on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            try:
-                state.handle_click(*click_to_norm(x, y, w, h))
-            except ValueError as e:
-                pending_msgs.append(str(e))
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        # сначала — hit-test панели кнопок (только верхняя область кадра);
+        # клик по кнопке НЕ передаётся в state.handle_click
+        name = hit_button(buttons, x, y)
+        if name is not None:
+            _do_button(name)
+            return
+        try:
+            removed = handle_size_click(state, x, y, w, h)
+            if removed is not None:
+                _notify(f"размер: точка удалена (x={removed[0]:.3f}, "
+                        f"y={removed[1]:.3f}, h={int(round(removed[2] * 100))}%)")
+        except ValueError as e:
+            _notify(str(e))
 
-    cv2.namedWindow(window_name)
-    cv2.setMouseCallback(window_name, on_mouse)
     try:
-        while True:
-            base = frames[idx]
-            img = _draw_calibration(base, state, mask_on, masks[idx], w, h)
-            hint_lines = _HINTS[state.mode].split("\n")
-            for i, msg in enumerate(pending_msgs):
-                put_text(img, msg[:80], (10, 34 + 24 * len(hint_lines) + i * 20),
-                         size_px=14, color=(0, 0, 255))
-            pending_msgs.clear()
-            cv2.imshow(window_name, img)
-            key = cv2.waitKey(1) & 0xFF
+        if not _load_cache():   # начальная загрузка первых cache_frames кадров
+            print("calibrate: ОШИБКА: не удалось прочитать ни одного кадра", file=sys.stderr)
+            return 1
+        print(f"calibrate: загрузил {len(frames)} кадр(ов) {w}x{h}, "
+              f"counter-id={counter_id!r}; [n/p] — листать, "
+              f"{'[t] — время (seek), ' if seek_supported else ''}[a] — сохранить в {config_path}")
 
-            if key in (ord("q"), ord("Q"), 27):
-                break
-            elif key == ord("l"):
-                state.set_mode("line")
-            elif key == ord("z"):
-                state.set_mode("zone")
-            elif key == ord("s"):
-                state.set_mode("size")
-            elif key == 13:  # Enter — замкнуть зону / завершить size-точки
-                if state.mode == "zone":
-                    try:
-                        state.finish_zone()
-                        pending_msgs.append(f"зона закрыта: {len(state.zone_points)} точек")
-                    except ValueError as e:
-                        pending_msgs.append(str(e))
-                elif state.mode == "size":
-                    state.finish_size()
-            elif key == ord("m"):
-                mask_on = not mask_on
-            elif key == ord("n"):
-                idx = (idx + 1) % len(frames)
-            elif key == ord("p"):
-                idx = (idx - 1) % len(frames)
-            elif key in tuple(ord(d) for d in "123456789") and state.mode == "size":
-                state.set_size_height(key - ord("0"))
-            elif key == ord("a"):
-                try:
-                    changed = apply_calibration(cfg, state)
-                    if not changed:
-                        pending_msgs.append(
-                        "ничего не менялось — нет собранных линий/зон/size-точек")
-                    else:
-                        Config.save(cfg, save_target)
-                        saved_once = True
-                        print(f"calibrate: сохранено в {save_target}:")
-                        for line in changed:
-                            print(f"  - {line}")
-                        print(f"calibrate: дальше — "
-                              f".venv/bin/python -m visio_people_counter count --config {save_target}")
-                except (ConfigError, OSError) as e:
-                    pending_msgs.append(f"ошибка записи: {e}")
+        cv2.namedWindow(window_name)
+        cv2.setMouseCallback(window_name, on_mouse)
+        try:
+            while True:
+                base = frames[idx]
+                img = _draw_calibration(base, state, mask_on, masks[idx], w, h)
+                buttons = draw_top_panel(img, state.counter_id, cfg.counters,
+                                         state.mode, mask_on, show_all=show_all)
+                # красные сообщения — под строкой кнопок (панель заканчивается ~y=66);
+                # живут MESSAGE_TTL_SECONDS секунд
+                pending_msgs[:] = filter_expired_messages(pending_msgs, time.monotonic())
+                for i, (msg, _exp) in enumerate(pending_msgs):
+                    draw_notification(img, msg[:90], x=10, y=72 + 20 * i, size_px=14)
+                if time_input_active:
+                    # буфер ввода времени дублируется на экране каждый кадр
+                    buf_str = "".join(str(d) for d in time_buf.digits) or "_"
+                    put_text(img, f"Время (сек): {buf_str} | Enter=OK, ESC/q=отмена",
+                             (10, 92), size_px=16, color=(0, 255, 255))
+                if show_all:
+                    # режим «все» — поверх всего: все линии/зоны из конфига с размерами;
+                    # текущий счётчик совпадает по цвету с редактируемым и не дублируется криво
+                    draw_all_counters(img, cfg.counters, w, h,
+                                      highlight_id=state.counter_id)
+                cv2.imshow(window_name, img)
+                key = cv2.waitKey(1) & 0xFF
+
+                if time_input_active:
+                    # режим ввода времени имеет приоритет: цифры НЕ идут в size-режим
+                    if key in (ord("q"), ord("Q"), 27):
+                        time_input_active = False
+                        time_buf.reset()
+                        _notify("ввод времени отменён")
+                    elif key == 13:   # Enter — применить seek
+                        _apply_time_seek()
+                    elif 48 <= key <= 57:    # цифры 0-9 → в буфер
+                        time_buf.feed_digit(key - 48)
+                    elif key in (ord("-"), 8, 127):   # '-' или Backspace (X11=127, Win=8)
+                        time_buf.backspace()
+                elif key in (ord("q"), ord("Q"), 27):
+                    break
+                elif key == ord("l"):
+                    state.set_mode("line")
+                elif key == ord("z"):
+                    state.set_mode("zone")
+                elif key == ord("s"):
+                    state.set_mode("size")
+                elif key == 13:  # Enter — замкнуть зону / завершить size-точки
+                    if state.mode == "zone":
+                        try:
+                            state.finish_zone()
+                            _notify(f"зона закрыта: {len(state.zone_points)} точек")
+                        except ValueError as e:
+                            _notify(str(e))
+                    elif state.mode == "size":
+                        state.finish_size()
+                elif key == ord("m"):
+                    mask_on = not mask_on
+                elif key == ord("v"):   # «все» — toggle показа всех счётчиков (только визуал)
+                    show_all = not show_all
+                elif key == ord("n"):
+                    idx = (idx + 1) % len(frames)
+                elif key == ord("p"):
+                    idx = (idx - 1) % len(frames)
+                elif key in tuple(ord(d) for d in "123456789") and state.mode == "size":
+                    state.set_size_height(key - ord("0"))
+                elif key == ord("x"):
+                    _do_delete()
+                elif key == ord("b"):   # отменить последнюю size-точку (только в режиме «размер»)
+                    _do_undo_size_point()
+                elif key == ord("["):   # стрелки у waitKey ненадёжны — берём [ ]
+                    _switch_counter(-1)
+                elif key == "]":
+                    _switch_counter(1)
+                elif key == ord("t"):
+                    _begin_time_input()
+                elif key == ord("a"):
+                    _do_save()
+        finally:
+            cv2.destroyAllWindows()
     finally:
-        cv2.destroyAllWindows()
+        # источник НЕ закрывается во время окна — он нужен для seek ([t]);
+        # close строго после destroyAllWindows
+        pipe.close()
 
     if not saved_once:
         print("calibrate: выход БЕЗ сохранения ([a] не нажимался или изменений не было)")

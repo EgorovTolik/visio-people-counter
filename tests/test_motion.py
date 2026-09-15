@@ -26,7 +26,10 @@ import numpy as np  # noqa: E402
 
 from visio_people_counter.config import Config, SizeProfileConfig  # noqa: E402
 from visio_people_counter.motion_detector import Blob, MotionDetector, filter_blobs  # noqa: E402
-from visio_people_counter.size_profile import SizeProfile  # noqa: E402
+from visio_people_counter.size_profile import (  # noqa: E402
+    SizeProfile,
+    fit_height_surface,
+)
 
 W, H = 640, 360
 PERSON_W, PERSON_H, PERSON_Y = 81, 221, 90   # cv2.rectangle — координаты включительно
@@ -206,32 +209,32 @@ class TestFilterBlobsUnit(unittest.TestCase):
     def test_wide_blob_filtered_by_aspect(self):
         stats, cents, counts = _make_cc([(100, 100, 200, 40, 7600)])  # w/h = 5.0 > 2.5
         self.assertEqual(filter_blobs(stats, cents, counts, self.objects,
-                                      lambda x: 0.0, lambda x: float("inf")), [])
+                                      lambda x, y: 0.0, lambda x, y: float("inf")), [])
         wide_ok = Config.from_dict({"objects": {"aspect_ratio_range": [0.2, 6.0]}}).objects
         blobs = filter_blobs(stats, cents, counts, wide_ok,
-                             lambda x: 0.0, lambda x: float("inf"))
+                             lambda x, y: 0.0, lambda x, y: float("inf"))
         self.assertEqual(len(blobs), 1)
         self.assertEqual((blobs[0].x, blobs[0].w), (100, 200))
 
     def test_sparse_blob_filtered_by_min_fill(self):
         stats, cents, counts = _make_cc([(50, 50, 100, 100, 500)])    # fill = 0.05 < 0.25
         self.assertEqual(filter_blobs(stats, cents, counts, self.objects,
-                                      lambda x: 0.0, lambda x: float("inf")), [])
+                                      lambda x, y: 0.0, lambda x, y: float("inf")), [])
         low_fill = Config.from_dict({"objects": {"min_fill": 0.0}}).objects
         self.assertEqual(len(filter_blobs(stats, cents, counts, low_fill,
-                                          lambda x: 0.0, lambda x: float("inf"))), 1)
+                                          lambda x, y: 0.0, lambda x, y: float("inf"))), 1)
 
     def test_area_bounds(self):
         stats, cents, counts = _make_cc([(100, 100, 40, 40, 1600)])   # area = 1600 px²
         # слишком малый для min_area_at
         self.assertEqual(filter_blobs(stats, cents, counts, self.objects,
-                                      lambda x: 2000.0, lambda x: float("inf")), [])
+                                      lambda x, y: 2000.0, lambda x, y: float("inf")), [])
         # слишком большой для max_area_at
         self.assertEqual(filter_blobs(stats, cents, counts, self.objects,
-                                      lambda x: 0.0, lambda x: 1500.0), [])
+                                      lambda x, y: 0.0, lambda x, y: 1500.0), [])
         # в пределах → проходит, поля Blob корректны
         blobs = filter_blobs(stats, cents, counts, self.objects,
-                             lambda x: 1000.0, lambda x: 2000.0)
+                             lambda x, y: 1000.0, lambda x, y: 2000.0)
         self.assertEqual(len(blobs), 1)
         b = blobs[0]
         self.assertIsInstance(b, Blob)
@@ -242,15 +245,16 @@ class TestFilterBlobsUnit(unittest.TestCase):
     def test_min_bbox_side(self):
         stats, cents, counts = _make_cc([(0, 0, 5, 50, 200)])          # w = 5 < 8 px
         self.assertEqual(filter_blobs(stats, cents, counts, self.objects,
-                                      lambda x: 0.0, lambda x: float("inf")), [])
+                                      lambda x, y: 0.0, lambda x, y: float("inf")), [])
 
 
 # ---------------------------------------------------------------------------
-# SizeProfile
+# SizeProfile (2D: h(x, y), задача 05)
 # ---------------------------------------------------------------------------
 
 class TestSizeProfile(unittest.TestCase):
-    def _profile(self, enabled=True, points=((0.0, 0.4), (0.5, 0.2), (1.0, 0.1))):
+    def _profile(self, enabled=True,
+                 points=((0.0, 0.5, 0.4), (0.5, 0.5, 0.3), (1.0, 0.5, 0.2))):
         sp_cfg = SizeProfileConfig(enabled=enabled, control_points=list(points),
                                    k_min=0.2, k_max=4.0)
         return SizeProfile(sp_cfg, Config.from_dict({}).objects, w=W, h=H)
@@ -258,38 +262,131 @@ class TestSizeProfile(unittest.TestCase):
     def test_interpolation_at_control_points_and_edges(self):
         sp = self._profile()
         self.assertTrue(sp.adaptive)
-        self.assertAlmostEqual(sp.person_height_px(0), 0.4 * H)      # первая точка
-        self.assertAlmostEqual(sp.person_height_px(W // 2), 0.2 * H)  # средняя
-        self.assertAlmostEqual(sp.person_height_px(W), 0.1 * H)       # последняя
-        self.assertAlmostEqual(sp.person_height_px(-50), 0.4 * H)     # за левым краем
-        self.assertAlmostEqual(sp.person_height_px(W + 999), 0.1 * H) # за правым краем
-        self.assertAlmostEqual(sp.person_height_px(W // 4), 0.3 * H)  # линейно между 0 и 0.5
+        yc = H // 2
+        self.assertAlmostEqual(sp.person_height_px(0, yc), 0.4 * H)      # первая точка
+        self.assertAlmostEqual(sp.person_height_px(W // 2, yc), 0.3 * H)  # средняя
+        self.assertAlmostEqual(sp.person_height_px(W, yc), 0.2 * H)       # последняя
+        self.assertAlmostEqual(sp.person_height_px(-50, yc), 0.4 * H)     # за левым краем (clip)
+        self.assertAlmostEqual(sp.person_height_px(W + 999, yc), 0.2 * H)  # за правым краем (clip)
+        self.assertAlmostEqual(sp.person_height_px(W // 4, yc), 0.35 * H)  # линейно между 0 и 0.5
+
+    def test_y_dependent_thresholds(self):
+        """Регрессия: пороги зависят не только от x, но и от y (2D-профиль)."""
+        sp = self._profile(points=((0.5, 0.2, 0.4), (0.5, 0.8, 0.2)))
+        xc = W // 2
+        self.assertGreater(sp.min_area_at(xc, int(0.2 * H)),
+                           sp.min_area_at(xc, int(0.8 * H)))
+        self.assertGreater(sp.max_area_at(xc, int(0.2 * H)),
+                           sp.max_area_at(xc, int(0.8 * H)))
 
     def test_min_max_area(self):
         sp = self._profile()
-        h_mid = 0.2 * H   # 72 px при x = W/2
-        self.assertAlmostEqual(sp.min_area_at(W // 2), 0.2 * h_mid ** 2)
-        self.assertAlmostEqual(sp.max_area_at(W // 2), 4.0 * h_mid ** 2)
+        h_mid = 0.3 * H   # px при x = W/2, y = H/2
+        self.assertAlmostEqual(sp.min_area_at(W // 2, H // 2), 0.2 * h_mid ** 2)
+        self.assertAlmostEqual(sp.max_area_at(W // 2, H // 2), 4.0 * h_mid ** 2)
         # пороги убывают вглубь кадра вместе с высотой человека
-        self.assertGreater(sp.min_area_at(0), sp.min_area_at(W))
+        self.assertGreater(sp.min_area_at(0, H // 2), sp.min_area_at(W, H // 2))
 
     def test_disabled_falls_back_to_global_thresholds(self):
         sp = self._profile(enabled=False)
         self.assertFalse(sp.adaptive)
         frame_area = float(W * H)
         for x in (0, W // 2, W):
-            self.assertAlmostEqual(sp.min_area_at(x), 0.0005 * frame_area)
-            self.assertAlmostEqual(sp.max_area_at(x), 0.25 * frame_area)
+            self.assertAlmostEqual(sp.min_area_at(x, H // 2), 0.0005 * frame_area)
+            self.assertAlmostEqual(sp.max_area_at(x, H // 2), 0.25 * frame_area)
 
     def test_enabled_but_empty_points_falls_back_to_global(self):
         sp = self._profile(enabled=True, points=())
         self.assertFalse(sp.adaptive)
-        self.assertAlmostEqual(sp.min_area_at(W // 2), 0.0005 * float(W * H))
+        self.assertAlmostEqual(sp.min_area_at(W // 2, H // 2), 0.0005 * float(W * H))
+
+    def test_single_point_adaptive_constant(self):
+        """Адаптивный режим включается уже с 1 точкой; высота — константа."""
+        sp = self._profile(points=((0.3, 0.4, 0.3),))
+        self.assertTrue(sp.adaptive)
+        for x, y in ((0, 0), (W // 2, H // 2), (W, H)):
+            self.assertAlmostEqual(sp.person_height_px(x, y), 0.3 * H)
+
+    def test_clamp_min_height_one_px(self):
+        sp = self._profile(points=((0.5, 0.5, 0.001),))
+        self.assertGreaterEqual(sp.person_height_px(W // 2, H // 2), 1.0)
+
+    def test_y_default_is_frame_center(self):
+        """Назад-совместимый вызов без y — середина кадра по y."""
+        sp = self._profile(points=((0.5, 0.2, 0.4), (0.5, 0.8, 0.2)))
+        self.assertAlmostEqual(sp.person_height_px(W // 2),
+                               sp.person_height_px(W // 2, H * 0.5))
 
     def test_buffer_width(self):
         sp = self._profile()
-        self.assertAlmostEqual(sp.buffer_width_px(W // 2, 0.75), 0.75 * 0.2 * H)
-        self.assertEqual(sp.buffer_width_px(0, 0.0), 0.0)
+        self.assertAlmostEqual(sp.buffer_width_px(W // 2, H // 2, 0.75), 0.75 * 0.3 * H)
+        self.assertEqual(sp.buffer_width_px(0, H // 2, 0.0), 0.0)
+        with self.assertRaises(ValueError):
+            sp.buffer_width_px(W // 2, H // 2, -1.0)
+
+    def test_clips_out_of_frame_coordinates(self):
+        sp = self._profile()
+        # за краями кадра (x < 0 / x > w / y < 0 / y > h) — граница, без падения
+        self.assertAlmostEqual(sp.person_height_px(-500, -500),
+                               sp.person_height_px(0, 0))
+        self.assertAlmostEqual(sp.person_height_px(W * 3, H * 2),
+                               sp.person_height_px(W, H))
+
+
+# ---------------------------------------------------------------------------
+# fit_height_surface: чистая функция подгонки поверхности h(x, y)
+# ---------------------------------------------------------------------------
+
+class TestFitHeightSurface(unittest.TestCase):
+    def test_four_points_biquadratic_exact(self):
+        a, b, c, d = 0.35, -0.15, -0.20, 0.10
+        pts = [(x, y, a + b * x + c * y + d * x * y)
+               for x, y in ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0))]
+        f = fit_height_surface(pts)
+        for x, y in ((0.25, 0.75), (0.5, 0.5), (0.9, 0.1), (0.1, 0.3)):
+            self.assertAlmostEqual(f.height_at(x, y),
+                                   a + b * x + c * y + d * x * y, places=8)
+
+    def test_five_points_on_same_surface_still_exact(self):
+        a, b, c, d = 0.3, -0.1, -0.25, 0.05
+        pts = [(x, y, a + b * x + c * y + d * x * y)
+               for x, y in ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0),
+                            (1.0, 1.0), (0.5, 0.25))]
+        f = fit_height_surface(pts)
+        self.assertAlmostEqual(f.height_at(0.7, 0.4),
+                               a + b * 0.7 + c * 0.4 + d * 0.28, places=8)
+
+    def test_three_points_plane_exact(self):
+        a, b, c = 0.4, -0.2, -0.1
+        pts = [(x, y, a + b * x + c * y) for x, y in ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))]
+        f = fit_height_surface(pts)
+        self.assertAlmostEqual(f.height_at(0.5, 0.25), a + b * 0.5 + c * 0.25, places=8)
+
+    def test_two_points_segment_interpolation(self):
+        p0, p1 = (0.2, 0.3, 0.4), (0.6, 0.7, 0.2)
+        f = fit_height_surface([p0, p1])
+        # t=0 и t=1 — сами точки
+        self.assertAlmostEqual(f.height_at(0.2, 0.3), 0.4, places=9)
+        self.assertAlmostEqual(f.height_at(0.6, 0.7), 0.2, places=9)
+        # середина отрезка (t=0.5)
+        self.assertAlmostEqual(f.height_at(0.4, 0.5), 0.3, places=9)
+        # за краями отрезка — крайнее значение
+        self.assertAlmostEqual(f.height_at(0.0, 0.1), 0.4, places=9)   # t<0 → t=0
+        self.assertAlmostEqual(f.height_at(0.9, 0.9), 0.2, places=9)   # t>1 → t=1
+
+    def test_one_point_constant(self):
+        f = fit_height_surface([(0.3, 0.7, 0.25)])
+        for x, y in ((0.0, 0.0), (0.5, 0.5), (1.0, 1.0)):
+            self.assertAlmostEqual(f.height_at(x, y), 0.25)
+
+    def test_query_outside_frame_is_clipped(self):
+        f = fit_height_surface([(0.0, 0.0, 0.4), (1.0, 1.0, 0.1)])
+        self.assertAlmostEqual(f.height_at(-5.0, -5.0), 0.4)
+        self.assertAlmostEqual(f.height_at(9.0, 2.0), 0.1)
+
+    def test_empty_points_rejected(self):
+        with self.assertRaises(ValueError):
+            fit_height_surface([])
 
 
 # ---------------------------------------------------------------------------

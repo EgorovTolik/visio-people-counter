@@ -259,9 +259,9 @@ class LineCounter(BaseCounter):
     # --- локальный масштаб (высота человека / фиксированный от длины линии) -----
 
     def _ref_scale(self, ip: np.ndarray) -> float:
-        """h_local в точке пересечения: из SizeProfile либо 0.5*длина линии."""
+        """h_local в точке пересечения: из SizeProfile (x И y) либо 0.5*длина линии."""
         if self._sp is not None and self._sp.adaptive:
-            return max(1.0, self._sp.person_height_px(float(ip[0])))
+            return max(1.0, self._sp.person_height_px(float(ip[0]), float(ip[1])))
         return 0.5 * self.line_len
 
     # --- обновление --------------------------------------------------------------

@@ -105,6 +105,17 @@ def cmd_count(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cache_frames_value(s: str) -> int:
+    """CLI-тип --cache-frames: целое >= 1 (размер кэша кадров calibrate)."""
+    try:
+        v = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--cache-frames: ожидалось целое, получено {s!r}")
+    if v < 1:
+        raise argparse.ArgumentTypeError("--cache-frames: ожидалось >= 1")
+    return v
+
+
 def cmd_calibrate(args: argparse.Namespace) -> int:
     """GUI-калибровка линии/зоны/size-точек.
 
@@ -113,7 +124,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     """
     from .calibrate import run_calibration
     return run_calibration(args.config or "config.yaml", video=args.video,
-                           counter_id=args.counter_id, save_to=args.config)
+                           counter_id=args.counter_id, save_to=args.config,
+                           cache_frames=args.cache_frames)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -153,6 +165,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="видео для калибровки (переопределяет video.path)")
     p_cal.add_argument("--counter-id", default="main_line", metavar="ID",
                        help="id счётчика, который рисуем/добавляем (по умолчанию main_line)")
+    p_cal.add_argument("--cache-frames", type=_cache_frames_value, default=100,
+                       metavar="N", help="сколько кадров держать в кэше листа [n/p] и "
+                                         "загружать после seek ([t]) (по умолчанию 100, >= 1)")
     p_cal.set_defaults(func=cmd_calibrate)
 
     return parser

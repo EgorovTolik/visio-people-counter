@@ -112,6 +112,15 @@ class VideoSource(ABC):
     def read(self) -> Optional[Frame]:
         """Прочитать следующий кадр; ``None`` = EOF либо «недоступен сейчас» (разрыв)."""
 
+    def seek(self, seconds: float) -> bool:
+        """Перемотать позицию чтения к метке ``seconds`` (сек) в таймлайне видео.
+
+        Базовая реализация возвращает ``False`` — случайный доступ недоступен
+        (например, ffmpeg-пайп/HLS-поток: только последовательное чтение).
+        Подклассы с файловым входом переопределяют и возвращают True при успехе.
+        """
+        return False
+
     @abstractmethod
     def close(self) -> None:
         """Закрыть источник и освободить ресурсы."""
@@ -130,6 +139,11 @@ class VideoSource(ABC):
     @abstractmethod
     def fps(self) -> float:
         """FPS источника (обрабатываемой последовательности)."""
+
+    @property
+    def duration(self) -> float:
+        """Длительность видео, с; 0.0 — если неизвестна."""
+        return 0.0
 
     def __enter__(self) -> "VideoSource":
         self.open()
@@ -191,6 +205,23 @@ class FileSource(VideoSource):
         self._index += 1
         return out
 
+    def seek(self, seconds: float) -> bool:
+        """Перемотать к метке ``seconds`` (сек): CAP_PROP_POS_MSEC.
+
+        Точность — «до ключевого кадра» (декодер cv2.VideoCapture встаёт на
+        ближайший доступный кадр не позже метки); для калибровки по времени
+        это допустимо. Позиция внутреннего счётчика ``_index`` сбрасывается
+        в ``int(round(seconds * fps))`` (0, если fps неизвестен).
+
+        :returns: True — перемотка выполнена (источник открыт), False — источник
+            закрыт/не открыт.
+        """
+        if self._cap is None:
+            return False
+        self._cap.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000.0)
+        self._index = int(round(seconds * self._fps)) if self._fps > 0 else 0
+        return True
+
     def close(self) -> None:
         if self._cap is not None:
             self._cap.release()
@@ -207,6 +238,18 @@ class FileSource(VideoSource):
     @property
     def fps(self) -> float:
         return self._fps
+
+    @property
+    def duration(self) -> float:
+        """Длительность файла, с (FRAME_COUNT/fps; фолбэк CAP_PROP_DURATION). 0.0 — неизвестна."""
+        if self._cap is None:
+            return 0.0
+        if self._fps > 0:
+            n = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if n > 0:
+                return float(n) / self._fps
+        d = float(self._cap.get(cv2.CAP_PROP_DURATION) or 0.0)
+        return d / 1000.0 if d > 0 else 0.0
 
 
 class FfmpegPipeSource(VideoSource):

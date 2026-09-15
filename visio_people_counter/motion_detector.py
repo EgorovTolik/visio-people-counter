@@ -11,7 +11,7 @@
 2. морфология ``MORPH_OPEN(morph_open)`` → ``MORPH_CLOSE(morph_close)``;
 3. ``connectedComponentsWithStats``;
 4. фильтры блока ``objects`` (см. :func:`filter_blobs`): площадь
-   (через ``SizeProfile.min/max_area_at(cx)``, либо глобальные доли кадра),
+   (через ``SizeProfile.min/max_area_at(cx, cy)``, либо глобальные доли кадра),
    ``min_bbox_side_px``, ``aspect_ratio_range``, ``min_fill``.
 
 ``min_lifetime_frames`` НЕ применяется в самом детекторе — его выполняет
@@ -49,7 +49,7 @@ def filter_blobs(stats: np.ndarray, centroids: np.ndarray, counts: list | np.nda
     :param centroids: массив (n, 2) — центры масс.
     :param counts: число пикселей на компоненту (индекс = номер компонента).
     :param objects_cfg: блок ``objects`` конфига.
-    :param min_area_at / max_area_at: callable ``x -> площадь в px²``
+    :param min_area_at / max_area_at: callable ``(x, y) -> площадь в px²``
         (из ``SizeProfile`` либо константы глобальных долей кадра).
 
     Порядок проверок: сторона bbox → aspect ratio → заполнение → площадь.
@@ -68,9 +68,10 @@ def filter_blobs(stats: np.ndarray, centroids: np.ndarray, counts: list | np.nda
         if fill < objects_cfg.min_fill:
             continue  # россыпь шума, ветка — bbox почти пустой
         cx = float(centroids[i][0])
-        if not (min_area_at(cx) <= area <= max_area_at(cx)):
+        cy = float(centroids[i][1])
+        if not (min_area_at(cx, cy) <= area <= max_area_at(cx, cy)):
             continue  # слишком малый/огромный для этой точки кадра
-        blobs.append(Blob(x=x, y=y, w=w, h=h, area=area, cx=cx, cy=float(centroids[i][1])))
+        blobs.append(Blob(x=x, y=y, w=w, h=h, area=area, cx=cx, cy=cy))
     return blobs
 
 
@@ -143,8 +144,8 @@ class MotionDetector:
             frame_area = float(frame_image.shape[0] * frame_image.shape[1])
             gmin = self._min_area_fraction * frame_area
             gmax = self._max_area_fraction * frame_area
-            min_area_at = lambda x, _g=gmin: _g   # noqa: E731
-            max_area_at = lambda x, _g=gmax: _g   # noqa: E731
+            min_area_at = lambda x, y, _g=gmin: _g   # noqa: E731
+            max_area_at = lambda x, y, _g=gmax: _g   # noqa: E731
 
         return filter_blobs(stats, centroids, counts, self._objects,
                             min_area_at, max_area_at)

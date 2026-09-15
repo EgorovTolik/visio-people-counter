@@ -282,5 +282,29 @@ class TestEventLog(unittest.TestCase):
         el.close()
 
 
+# ---------------------------------------------------------------------------
+# LineCounter + SizeProfile (2D): ширина буфера зависит и от y пересечения
+# ---------------------------------------------------------------------------
+
+class TestLineCounterSizeProfileYDependence(unittest.TestCase):
+    """Задача 05: h_local (масштаб буфера) в точке пересечения берётся по (x, y),
+    а не только по x — при вертикальной линии разные y дают разную ширину."""
+
+    def test_ref_scale_differs_by_y_at_same_x(self):
+        import numpy as np
+        from visio_people_counter.config import Config, SizeProfileConfig
+        from visio_people_counter.size_profile import SizeProfile
+        sp_cfg = SizeProfileConfig(enabled=True,
+                                   control_points=[(0.5, 0.2, 0.4),
+                                                   (0.5, 0.8, 0.2)])
+        sp = SizeProfile(sp_cfg, Config.from_dict({}).objects, w=640, h=480)
+        lc = LineCounter(LineCounterConfig(id="m", a=(0.5, 0.0), b=(0.5, 1.0)),
+                         w=640, h=480, size_profile=sp)
+        near = lc._ref_scale(np.array([320.0, 96.0]))    # y=0.2*480 — ближе к камере
+        far = lc._ref_scale(np.array([320.0, 384.0]))    # y=0.8*480 — глубже кадра
+        self.assertGreater(near, far,
+                           "буфер должен быть шире там, где человек крупнее")
+
+
 if __name__ == "__main__":
     unittest.main()

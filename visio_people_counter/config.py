@@ -139,6 +139,52 @@ def _get_pair_list(d: dict, key: str, path: str, default: list[tuple[float, floa
     return out
 
 
+def _get_size_points(d: dict, key: str, path: str,
+                     default: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+    """Контрольные точки size_profile: тройки ``[x_доля, y_доля, h_доля]``.
+
+    x, y — в диапазоне 0..1 (доли кадра), h — в 0..1 и строго > 0 (доля высоты
+    кадра). Назад-совместимость: старые пары ``[x, h]`` мигрируются в
+    ``[x, 0.5, h]`` с warning'ом в stdout; при сохранении пишутся ТОЛЬКО тройки.
+    """
+    if key not in d:
+        return copy.deepcopy(default)
+    v = d[key]
+    _require(isinstance(v, list), f"{path}.{key}", "список точек [x, y, h]", v)
+    out: list[tuple[float, float, float]] = []
+    legacy = False
+    for i, item in enumerate(v):
+        p = f"{path}.{key}[{i}]"
+        _require(
+            isinstance(item, (list, tuple)) and len(item) in (2, 3),
+            p, "тройка [x, y, h] (или старую пару [x, h])", item,
+        )
+        if len(item) == 2:
+            # legacy-формат: [x, h] → [x, 0.5, h]; y берётся из миграции
+            raws = [("x", item[0]), ("h", item[1])]
+            x, _y, h = float(item[0]), 0.5, float(item[1])
+            legacy = True
+        else:
+            raws = [("x", item[0]), ("y", item[1]), ("h", item[2])]
+            x, _y, h = (float(item[0]), float(item[1]), float(item[2]))
+        for name, raw in raws:
+            _require(
+                isinstance(raw, (int, float)) and not isinstance(raw, bool),
+                f"{p}.{name}", "число", raw,
+            )
+        _require(0.0 <= x <= 1.0, f"{p}.x", "доля кадра в диапазоне 0..1", item[0])
+        if len(item) == 3:
+            _require(0.0 <= _y <= 1.0, f"{p}.y", "доля кадра в диапазоне 0..1", item[1])
+        if not (h > 0.0):
+            raise ConfigError(f"{p}.h: ожидалось доля высоты человека > 0, получено {item[-1]!r}")
+        _require(h <= 1.0, f"{p}.h", "доля кадра в диапазоне (0, 1]", item[-1])
+        out.append((x, _y, h))
+    if legacy:
+        print("size_profile: старые точки [x, h] перенесены как y=0.5 — "
+              "при возможности перекалибруйте")
+    return out
+
+
 def _get_range(d: dict, key: str, path: str, default: tuple[float, float], min_bound: float = 0.0) -> tuple[float, float]:
     """Диапазон [min, max] чисел (например aspect_ratio_range); обе части >= min_bound."""
     if key not in d:
@@ -305,9 +351,14 @@ class ObjectsConfig:
 
 @dataclass
 class SizeProfileConfig:
-    """Адаптация порогов площади к размеру объекта в точке кадра (опционально)."""
+    """Адаптация порогов площади к размеру объекта в точке кадра (опционально).
+
+    ``control_points`` — тройки ``[x_доля, y_доля, h_доля]``: точка кадра (x, y)
+    и ожидаемая высота человека в ней (доля высоты кадра). Старые пары ``[x, h]``
+    при загрузке мигрируются в ``[x, 0.5, h]`` (см. :func:`_get_size_points`).
+    """
     enabled: bool = False
-    control_points: list[tuple[float, float]] = field(default_factory=list)  # [x_fraction, person_height_fraction]
+    control_points: list[tuple[float, float, float]] = field(default_factory=list)  # [x_frac, y_frac, person_height_fraction]
     k_min: float = 0.2                   # min_area = k_min * h_px^2
     k_max: float = 4.0                   # max_area = k_max * h_px^2
 
@@ -319,7 +370,7 @@ class SizeProfileConfig:
         )
         return cls(
             enabled=_get_bool(d, "enabled", "size_profile", False),
-            control_points=_get_pair_list(d, "control_points", "size_profile", []),
+            control_points=_get_size_points(d, "control_points", "size_profile", []),
             k_min=_get_float(d, "k_min", "size_profile", 0.2),
             k_max=_get_float(d, "k_max", "size_profile", 4.0),
         )

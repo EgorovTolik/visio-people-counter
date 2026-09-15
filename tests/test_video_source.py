@@ -83,9 +83,108 @@ class TestFileSource(_VideoMixin, unittest.TestCase):
         self.assertGreaterEqual(total, N_FRAMES)      # дошёл хотя бы до первого EOF
         self.assertTrue(saw_wrap, "loop_file должен перемотать в начало")
 
+    def test_duration_known_and_close_to_expected(self):
+        with FileSource(str(self.video_path)) as src:
+            d = src.duration
+            # 30 кадров @ 30 fps = ~1 с; контейнер может добавить дробь — допускаем разброс
+            self.assertGreater(d, 0.5)
+            self.assertLess(d, 2.0)
+
     def test_missing_file(self):
         with self.assertRaises(VideoSourceError):
             FileSource("/nonexistent/nope.mp4").open()
+
+    def test_seek_before_open_returns_false(self):
+        src = FileSource(str(self.video_path))
+        self.addCleanup(src.close)
+        self.assertFalse(src.seek(1.0), "seek до open() должен вернуть False")
+
+    def test_seek_zero_reads_from_start(self):
+        with FileSource(str(self.video_path)) as src:
+            # после seek(0) — полная последовательность с index=0 (как без seek)
+            self.assertTrue(src.seek(0.0))
+            frames = []
+            while True:
+                f = src.read()
+                if f is None:
+                    break
+                frames.append(f)
+        self.assertEqual(len(frames), N_FRAMES)
+        self.assertEqual(frames[0].index, 0)
+        # t_video первого кадра — в начале таймлайна
+        self.assertIsNotNone(frames[0].t_video)
+        self.assertLess(frames[0].t_video, 0.1)
+
+    def test_seek_midway_starts_later(self):
+        """seek(0.5) на видео 1 c @30fps: чтение начинается позже → до EOF меньше кадров."""
+        with FileSource(str(self.video_path)) as src:
+            self.assertTrue(src.seek(0.5))
+            frames = []
+            while True:
+                f = src.read()
+                if f is None:
+                    break
+                frames.append(f)
+        # до ключевого кадра: начало в районе 15-го кадра (±2 на точность декодера)
+        self.assertGreater(len(frames), 0, "после seek(0.5) не прочиталось ни одного кадра")
+        self.assertLess(len(frames), N_FRAMES,
+                        "seek(0.5) должен начать чтение позже начала файла")
+        self.assertEqual(frames[0].index, int(round(0.5 * FPS)))   # _index сброшен по fps
+        if frames[0].t_video is not None:
+            # t_video согласуется с меткой (±0.3 c — точность «до ключевого кадра»)
+            self.assertAlmostEqual(frames[0].t_video, 0.5, delta=0.3)
+
+    def test_seek_then_close_and_reopen(self):
+        """seek не ломает повторное открытие: после close/open чтение снова с начала."""
+        src = FileSource(str(self.video_path))
+        self.addCleanup(src.close)
+        src.open()
+        self.assertTrue(src.seek(0.7))
+        src.read()
+        src.close()
+        self.assertFalse(src.seek(1.0), "seek после close() → False")
+        src.open()
+        f = src.read()
+        self.assertIsNotNone(f)
+        self.assertEqual(f.index, 0)
+
+
+class TestSeekUnsupported(unittest.TestCase):
+    """Базовый VideoSource.seek: ffmpeg-пайп/HLS — случайного доступа нет → False."""
+
+    def test_ffmpeg_pipe_source_seek_returns_false(self):
+        src = FfmpegPipeSource("https://example.com/stream.m3u8")
+        self.addCleanup(src.close)
+        self.assertFalse(src.seek(5.0))
+        # и без open/close — False, без побочных эффектов
+
+    def test_abc_default_seek_is_false(self):
+        """Подкласс, не переопределяющий seek, наследует базовый False (как pipe)."""
+        from visio_people_counter.video_source import VideoSource
+
+        class _NoSeekSource(VideoSource):
+            def open(self) -> None:
+                pass
+
+            def read(self):
+                return None
+
+            def close(self) -> None:
+                pass
+
+            @property
+            def width(self) -> int:
+                return 0
+
+            @property
+            def height(self) -> int:
+                return 0
+
+            @property
+            def fps(self) -> float:
+                return 0.0
+
+        self.assertFalse(_NoSeekSource().seek(1.0))
 
 
 class TestFfmpegPipeSource(_VideoMixin, unittest.TestCase):

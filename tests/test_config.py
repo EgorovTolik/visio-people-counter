@@ -159,6 +159,44 @@ class TestConfigValidation(unittest.TestCase):
         self.assertIn("не найден", str(cm.exception))
 
 
+class TestSizeProfilePoints(unittest.TestCase):
+    """size_profile.control_points: тройки [x, y, h] + legacy-миграция пар (задача 05)."""
+
+    def test_triples_accepted(self):
+        sp = Config.from_dict({"size_profile": {
+            "enabled": True,
+            "control_points": [[0.1, 0.9, 0.45], [0.8, 0.3, 0.08]]}}).size_profile
+        self.assertEqual(sp.control_points, [(0.1, 0.9, 0.45), (0.8, 0.3, 0.08)])
+
+    def test_legacy_pairs_migrated_to_y_half(self):
+        sp = Config.from_dict({"size_profile": {
+            "enabled": True,
+            "control_points": [[0.1, 0.45], [0.9, 0.08]]}}).size_profile
+        self.assertEqual(sp.control_points, [(0.1, 0.5, 0.45), (0.9, 0.5, 0.08)])
+
+    def test_bad_points_rejected(self):
+        for bad in ([0.1], [1.5, 0.5, 0.2], [0.1, 1.2, 0.3],
+                    [0.1, 0.5, 0.0], [0.1, 0.5, 1.1], "x"):
+            with self.assertRaises(ConfigError):
+                Config.from_dict({"size_profile": {"control_points": [bad]}})
+
+    def test_save_writes_triples_and_roundtrips(self):
+        import tempfile
+        import yaml
+        cfg = Config.from_dict({"size_profile": {
+            "enabled": True,
+            "control_points": [[0.1, 0.9, 0.4], [0.8, 0.3, 0.1]]}})
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "c.yaml"
+            Config.save(cfg, p)
+            raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+            for pt in raw["size_profile"]["control_points"]:
+                self.assertEqual(len(pt), 3, "в YAML должны писаться только тройки")
+            cfg2 = Config.load(p)
+        self.assertEqual(cfg2.size_profile.control_points,
+                         [(0.1, 0.9, 0.4), (0.8, 0.3, 0.1)])
+
+
 class TestConfigDefault(unittest.TestCase):
     """Config.default() — первый запуск calibrate без файла."""
 
