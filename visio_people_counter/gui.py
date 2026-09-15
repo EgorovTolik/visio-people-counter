@@ -288,6 +288,9 @@ class GuiPlayer:
         for c in pipe.counters:
             events.extend(c.update(countable, frame.t_wall,
                                    t_video=frame.t_video, frame_index=frame.index))
+        # markdown-отчёт (задача 10): те же данные, что Pipeline.step копит в headless
+        pipe.report_events.extend(events)
+        pipe.frames_processed += 1
         if events:
             pipe.event_log.log_events(events)
             for ev in events:
@@ -362,6 +365,8 @@ class GuiPlayer:
                         time.sleep(target)
         finally:
             cv2.destroyAllWindows()
+            # markdown-отчёт (задача 10) — как в headless: до close(), нужны fps/duration
+            pipe._write_report("окно закрыто (GUI)")
             pipe.close()
         _emit("GUI-режим: окно закрыто")
         return 0

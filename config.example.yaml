@@ -209,6 +209,9 @@ output:
   events_jsonl: results/events.jsonl   # лог событий: по одной JSON-строке на пересечение
                                        # (track_id, counter_id, direction, t_video, координаты...)
                                        # "" = не писать
+  report_path: ""                     # markdown-отчёт с итогами по счётчикам и таблицей событий.
+                                      # "" = автопуть рядом с видео <видео>.report.md (только для файла);
+                                      # для HLS/URL автоотчёта нет — задайте путь явно, напр. reports/run.md
   summary_interval_s: 30               # печатать промежуточную сводку (in/out/total)
                                        # в stdout каждые N секунд; 0 = только финал
   final_summary: true                  # печатать итоговую сводку при завершении

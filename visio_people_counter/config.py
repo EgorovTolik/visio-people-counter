@@ -459,6 +459,7 @@ CounterConfig = LineCounterConfig | ZoneCounterConfig
 class OutputConfig:
     """Где и как писать результаты."""
     events_jsonl: str = ""                          # "" = не писать
+    report_path: str = ""                           # "" = автопуть <видео>.report.md (только для файла)
     summary_interval_s: float = 30                  # 0 = только финал
     final_summary: bool = True
 
@@ -466,10 +467,11 @@ class OutputConfig:
     def from_dict(cls, d: Any) -> "OutputConfig":
         d = _as_dict(d, "output")
         _check_unknown_keys(
-            d, {"events_jsonl", "summary_interval_s", "final_summary"}, "output"
+            d, {"events_jsonl", "report_path", "summary_interval_s", "final_summary"}, "output"
         )
         return cls(
             events_jsonl=_get_str(d, "events_jsonl", "output", ""),
+            report_path=_get_str(d, "report_path", "output", ""),
             summary_interval_s=_get_float(d, "summary_interval_s", "output", 30.0),
             final_summary=_get_bool(d, "final_summary", "output", True),
         )

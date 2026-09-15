@@ -1325,5 +1325,48 @@ class TestSizePointHitAndDelete(unittest.TestCase):
         self.assertEqual(len(out), 12)
 
 
+class TestGuiProcessFrameFeedsReport(unittest.TestCase):
+    """GUI-цикл дублирует Pipeline.step — данные для markdown-отчёта должны
+    пополняться так же (регрессия: отчёт после --gui был с нулями)."""
+
+    def test_report_events_and_frames_processed_updated(self):
+        from types import SimpleNamespace
+        ev = SimpleNamespace(counter_id="line_1", direction="in",
+                             track_id=3, x_px=1.0, y_px=2.0, frame_index=7)
+        pipe = self._pipe([ev])
+        player = GuiPlayer(pipe)
+        frame = SimpleNamespace(image=np.zeros((16, 16, 3), np.uint8),
+                                t_wall=1.0, t_video=1.0, index=7)
+        player._process_frame(frame)
+        self.assertEqual(pipe.report_events, [ev])   # событие попало в отчёт
+        self.assertEqual(pipe.frames_processed, 1)   # кадр учтён в мета-данных
+
+    def test_no_events_still_counts_frame(self):
+        pipe = self._pipe([])
+        player = GuiPlayer(pipe)
+        from types import SimpleNamespace
+        frame = SimpleNamespace(image=np.zeros((16, 16, 3), np.uint8),
+                                t_wall=1.0, t_video=1.0, index=7)
+        player._process_frame(frame)
+        self.assertEqual(pipe.report_events, [])
+        self.assertEqual(pipe.frames_processed, 1)
+
+    @staticmethod
+    def _pipe(events_out):
+        from types import SimpleNamespace
+        counter = SimpleNamespace(
+            update=lambda objs, t, t_video=0.0, frame_index=0: list(events_out))
+        return SimpleNamespace(
+            cfg=Config.from_dict({}),
+            size_profile=None,
+            detector=SimpleNamespace(detect=lambda img, sp: []),
+            tracker=SimpleNamespace(update=lambda blobs: []),
+            counters=[counter],
+            event_log=SimpleNamespace(log_events=lambda evs: None),
+            report_events=[],
+            frames_processed=0,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

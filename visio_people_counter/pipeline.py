@@ -51,6 +51,7 @@ import numpy as np
 from .config import Config
 from .event_log import EventLog
 from .line_counter import BaseCounter, CrossingEvent, LineCounter, ZoneCounter, build_counters
+from .report import RunMeta, build_report, choose_report_path, write_report
 from .motion_detector import MotionDetector
 from .size_profile import SizeProfile
 from .tracker_adapter import TrackerAdapter
@@ -131,6 +132,7 @@ class Pipeline:
         # --- состояние run() ------------------------------------------------------
         self.warmup_done: bool = False          # субтрактор прогрет (~history/2 кадров)
         self.frames_processed: int = 0          # кадров, прошедших через конвейер
+        self.report_events: list[CrossingEvent] = []  # все события прогона (для markdown-отчёта)
         self.duration_s: float = 0.0            # длительность обработки (wall)
         self.avg_fps: float = 0.0               # frames_processed / duration_s
         self.ema_fps: float = 0.0               # EMA fps обработки
@@ -256,6 +258,7 @@ class Pipeline:
         for c in self.counters:
             events.extend(c.update(countable, frame.t_wall,
                                    t_video=frame.t_video, frame_index=frame.index))
+        self.report_events.extend(events)
         if events:
             self.event_log.log_events(events)
             for ev in events:
@@ -326,6 +329,38 @@ class Pipeline:
                 print(f"{name:<14}: p50={_percentile(vals, 0.50):8.2f}  "
                       f"p95={_percentile(vals, 0.95):8.2f}", flush=True)
 
+    # ------------------------------------------------------------------ report
+    def _write_report(self, reason: str) -> None:
+        """Markdown-отчёт в конце прогона (всегда, даже при 0 событий; любой reason).
+
+        Путь — :func:`choose_report_path`: явный ``output.report_path`` либо автопуть
+        ``<видео>.report.md`` для файла; HLS/URL без явного пути → отчёт не создаётся.
+        Ошибка записи не роняет конвейер (warning в stderr, как у debug-кадров).
+        """
+        path = choose_report_path(self.cfg)
+        if path is None:
+            _emit("отчёт не создаётся: нет локального видео и явного output.report_path")
+            return
+        v = self.cfg.video
+        source_name = Path(v.path).name if (v.type == "file" and not is_url(v.path)) else v.path
+        fps = float(getattr(self.source, "fps", 0.0) or 0.0) if self.source is not None else 0.0
+        duration = float(getattr(self.source, "duration", 0.0) or 0.0) if self.source is not None else 0.0
+        meta = RunMeta(
+            source=source_name,
+            frames_processed=self.frames_processed,
+            fps=fps if fps > 0 else None,
+            duration_s=duration if duration > 0 else None,
+            reason=reason,
+        )
+        try:
+            write_report(path, build_report(self.cfg, self.report_events, meta))
+        except OSError as e:
+            print(f"[pipeline] отчёт {path}: не удалось сохранить: {e}",
+                  file=sys.stderr, flush=True)
+            return
+        print("=== ОТЧЁТ ===", flush=True)
+        print(str(path), flush=True)
+
     # ------------------------------------------------------------------ run
     def _file_skip(self) -> int:
         """Каждый N-й кадр обрабатывать для FileSource при effective_fps > 0."""
@@ -393,6 +428,7 @@ class Pipeline:
             self.duration_s = time.monotonic() - t_start
             self.avg_fps = self.frames_processed / max(1e-6, self.duration_s)
             self._print_final(reason)
+            self._write_report(reason)  # до close(): нужны fps/duration источника
             self.close()
             if in_main_thread and prev_handler is not None:
                 try:
