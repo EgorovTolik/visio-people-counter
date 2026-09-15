@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 videos/
+results/
 *.mp4
 *.ts
 *.m3u8
