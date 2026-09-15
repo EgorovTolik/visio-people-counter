@@ -9,10 +9,11 @@
 * **l** + 2 клика / кнопка «линия» — линия A→B для выбранного счётчика
   (порядок кликов = направление «in»);
 * **z** + N кликов, **Enter** / кнопка «зона» — замкнуть полигон зоны (>= 3 точки);
-* **s** + клик (x, y) + цифра **1..9** (высота человека как % высоты кадра:
-  1=5%, 2=10%, ..., 9=45%), **Enter** / кнопка «size» — завершить набор size-точек;
-  клик по УЖЕ НАРИСОВАННОЙ size-точке (hit-радиус ~15 px) удаляет её, а
-  **b** / кнопка «−точка» отменяют ПОСЛЕДНЮЮ size-точку;
+* **s** + ДВА клика «меркой роста» (верх и низ человека в этом месте кадра):
+  центр точки = середина пары, рост = длина отрезка в долях высоты кадра;
+  **Enter** / кнопка «size» — завершить набор size-точек; клик по УЖЕ НАРИСОВАННОЙ
+  size-точке (hit-радиус ~15 px, только когда pending-клики нет) удаляет её, а
+  **b** отменяет ПОСЛЕДНЮЮ size-точку (кнопки нет — конкретную мерку удаляют кликом по ней);
 * **m** / кнопка «маска» — toggle показа текущей маски движения (live-подстройка порога);
 * **v** / кнопка «все» — toggle режима просмотра ВСЕХ счётчиков из конфига: каждая
   линия/зона рисуется поверх кадра с размером (линия — длина в px и нормализованная,
@@ -25,6 +26,8 @@
   точки в state (чтобы сохранение не «воскресило» счётчик) и переключиться на
   соседний или новый той же природы;
 * **n/p** — следующий/предыдущий из загруженных кадров;
+* **`,` / `.`** — масштаб ОТОБРАЖЕНИЯ окна: пресеты 0.5/1/1.5/2 (уменьшить/
+  увеличить, с циклом); только экран — обработка и координаты конфига не меняются;
 * **t** / кнопка «время» — seek к заданному времени (секунды, только для файла:
   набрать цифры 0-9, Enter=OK, ESC/q=отмена; кэш заменяется кадрами после метки,
   линии/зоны/счётчик не сбрасываются);
@@ -34,7 +37,7 @@
 
 Вся логика «клик → обновление конфига», переключение счётчиков и раскладка/hit-test
 кнопок вынесена в чистые функции (:class:`CalibrationState`, :func:`click_to_norm`,
-:func:`size_digit_to_fraction`, :func:`apply_calibration`, :func:`cycle_counter_id`,
+:func:`apply_calibration`, :func:`cycle_counter_id`,
 :func:`make_new_counter_id`, :func:`load_counter_into_state`,
 :func:`delete_current_counter`, :func:`layout_buttons`, :func:`hit_button`,
 :func:`size_point_at_click`, :func:`remove_size_point`, :func:`undo_last_size_point`,
@@ -137,14 +140,9 @@ def click_to_norm(x: int, y: int, w: int, h: int) -> tuple[float, float]:
     return (round(nx, 4), round(ny, 4))
 
 
-def size_digit_to_fraction(digit: int) -> float:
-    """Цифра 1..9 → высота человека в долях высоты кадра (1=5% ... 9=45%).
-
-    :raises ValueError: цифра вне 1..9.
-    """
-    if not isinstance(digit, int) or isinstance(digit, bool) or not (1 <= digit <= 9):
-        raise ValueError(f"цифра высоты: ожидалось int 1..9, получено {digit!r}")
-    return round(0.05 * digit, 2)
+#: минимальная «мерка роста» (доля высоты кадра): короче — пара не добавляется
+#: (защита от случайного двойного клика в одной точке).
+MIN_SIZE_FRACTION = 0.01
 
 
 #: максимальное число знаков в буфере ввода времени (seek-секунды).
@@ -194,13 +192,18 @@ class CalibrationState:
     line_points: list[tuple[float, float]] = field(default_factory=list)   # норм. (x, y)
     zone_points: list[tuple[float, float]] = field(default_factory=list)   # норм. (x, y)
     size_points: list[tuple[float, float, float]] = field(default_factory=list)  # [x_frac, y_frac, h_frac]
-    _size_x: Optional[float] = None  # x последней 's'-точки, ждёт цифру
-    _size_y: Optional[float] = None  # y последней 's'-точки, ждёт цифру
+    #: первый клик «мерки роста» (pending-пара): ждёт второй клик (верх/низ человека)
+    size_first_point: Optional[tuple[float, float]] = None
 
     def set_mode(self, mode: str) -> None:
-        """Переключить режим ('l'/'z'/'s'); переключение очищает НОВЫЙ набор."""
+        """Переключить режим ('l'/'z'/'s'); переключение очищает НОВЫЙ набор.
+
+        Pending-пара size («первый клик мерки») сбрасывается при ЛЮБОЙ смене режима —
+        она не должна переживать выход из режима «размер».
+        """
         if mode not in ("line", "zone", "size"):
             raise ValueError(f"режим калибровки: ожидалось line/zone/size, получено {mode!r}")
+        self.size_first_point = None
         self.mode = mode
         if mode == "line":
             self.line_points = []
@@ -208,10 +211,6 @@ class CalibrationState:
         elif mode == "zone":
             self.zone_points = []
             self.line_points = []
-            self._size_x = None
-            self._size_y = None
-        else:  # size: точки накапливаются до Enter
-            pass
 
     def handle_click(self, x_norm: float, y_norm: float) -> None:
         """Клик в текущем режиме (координаты уже нормализованы)."""
@@ -222,18 +221,11 @@ class CalibrationState:
         elif self.mode == "zone":
             self.zone_points.append((x_norm, y_norm))
         elif self.mode == "size":
-            # высоту задаст следующая цифра 1..9; важны ОБЕ координаты (2D-профиль)
-            self._size_x = x_norm
-            self._size_y = y_norm
-
-    def set_size_height(self, digit: int) -> None:
-        """Цифра 1..9 в режиме 's': фиксирует высоту точки (x и y — из клика)."""
-        if self.mode != "size" or self._size_x is None or self._size_y is None:
-            return
-        self.size_points.append((self._size_x, self._size_y,
-                                 size_digit_to_fraction(digit)))
-        self._size_x = None
-        self._size_y = None
+            # «мерка роста»: этот клик — первый из пары (второй завершит точку);
+            # если pending уже есть — пара НЕ перезаписывается (завершается через
+            # handle_size_click, где есть защита от слишком короткой мерки)
+            if self.size_first_point is None:
+                self.size_first_point = (x_norm, y_norm)
 
     def finish_zone(self) -> list[tuple[float, float]]:
         """Enter в режиме 'z': закрыть полигон. :raises ValueError: < 3 точек."""
@@ -243,9 +235,58 @@ class CalibrationState:
         return list(self.zone_points)
 
     def finish_size(self) -> None:
-        """Enter в режиме 's': завершить набор size-точек."""
-        self._size_x = None
-        self._size_y = None
+        """Enter в режиме 's': завершить набор size-точек (pending-пара сбрасывается)."""
+        self.size_first_point = None
+
+
+#: пресеты масштаба ОТОБРАЖЕНИЯ окна (только imshow; обработка и координаты
+#: конфигурации всегда в исходном разрешении кадра). Клавиши: `,` — уменьшить,
+#: `.` — увеличить (с циклом по концам).
+SCALE_PRESETS = (0.5, 1.0, 1.5, 2.0)
+
+
+def next_scale(current: float, direction: int) -> float:
+    """Следующий пресет масштаба отображения (чистая функция).
+
+    :param current: текущий масштаб (может быть и не из :data:`SCALE_PRESETS`).
+    :param direction: +1 — следующий БОЛЬШИЙ пресет (больше всех → первый),
+        -1 — предыдущий МЕНЬШИЙ пресет (меньше всех → последний).
+    :raises ValueError: direction не ±1.
+
+    Примеры: 0.5→1.0→1.5→2.0→0.5 (вверх); 1.0→0.5→2.0→1.5 (вниз);
+    не-пресет 1.2: +1 → 1.5, -1 → 1.0.
+    """
+    if direction not in (-1, 1):
+        raise ValueError(f"направление масштаба: ожидалось -1 или 1, получено {direction!r}")
+    if direction > 0:
+        for p in SCALE_PRESETS:
+            if p > current:
+                return p
+        return SCALE_PRESETS[0]
+    for p in reversed(SCALE_PRESETS):
+        if p < current:
+            return p
+    return SCALE_PRESETS[-1]
+
+
+def unscale_mouse(x: int, y: int, scale: float,
+                  w: Optional[int] = None, h: Optional[int] = None) -> tuple[int, int]:
+    """Координаты мыши на МАСШТАБИРОВАННОЙ картинке → координаты исходного кадра.
+
+    Деление на ``scale`` с округлением; если заданы ``w``/``h`` (размер исходного
+    кадра) — результат зажимается в [0, w-1] / [0, h-1].
+
+    :raises ValueError: scale <= 0.
+    """
+    if scale <= 0:
+        raise ValueError(f"масштаб: ожидалось > 0, получено {scale!r}")
+    ux = int(round(x / scale))
+    uy = int(round(y / scale))
+    if w is not None and w > 0:
+        ux = max(0, min(w - 1, ux))
+    if h is not None and h > 0:
+        uy = max(0, min(h - 1, uy))
+    return (ux, uy)
 
 
 def size_point_at_click(size_points, x_px: int, y_px: int, w: int, h: int,
@@ -278,10 +319,10 @@ def remove_size_point(state: CalibrationState,
 
 
 def undo_last_size_point(state: CalibrationState) -> Optional[tuple]:
-    """Отменить ПОСЛЕДНЮЮ size-точку (клавиша [b] / кнопка «−точка»).
+    """Отменить ПОСЛЕДНЮЮ size-точку (клавиша [b]; кнопки в панели нет).
 
     Возвращает удалённую точку ``[x, y, h]``; пустой список → None (без падений).
-    Ожидающая цифру точка (``_size_x/_size_y``) при этом не трогается.
+    Pending-пара size (``size_first_point``) при этом не трогается.
     """
     if not state.size_points:
         return None
@@ -290,25 +331,52 @@ def undo_last_size_point(state: CalibrationState) -> Optional[tuple]:
 
 def handle_size_click(state: CalibrationState, x_px: int, y_px: int,
                       w: int, h: int,
-                      radius_px: int = SIZE_POINT_HIT_RADIUS_PX) -> Optional[tuple]:
+                      radius_px: int = SIZE_POINT_HIT_RADIUS_PX) -> list[str]:
     """Клик в режиме «размер» (координаты в px экрана) — чистая функция.
 
-    * клик попал по существующей size-точке (:func:`size_point_at_click`) →
-      удалить её и вернуть удалённую точку;
-    * иначе — обычный клик: запомнить новую ожидающую цифру точку
-      (:meth:`CalibrationState.handle_click`), вернуть None.
+    Механика «мерки роста» (два клика):
 
-    Hit-логика удаления активна ТОЛЬКО в режиме «размер»: в других режимах
-    клик просто передаётся в :meth:`CalibrationState.handle_click`
+    * есть pending ``size_first_point`` → ВТОРОЙ клик завершает пару:
+      ``x = (x1+x2)/2``, ``y = (y1+y2)/2`` (центр),
+      ``h = |y2-y1| / frame_h`` (доля высоты кадра); тройка ``(x, y, h)``
+      добавляется в ``state.size_points``, pending сбрасывается. Если
+      ``|y2-y1| < :data:`MIN_SIZE_FRACTION`` (~1% кадра) — точка НЕ добавляется,
+      возвращается уведомление «слишком маленькая мерка», pending всё равно
+      сбрасывается;
+    * иначе клик по существующей size-точке (:func:`size_point_at_click`,
+      hit-радиус ``radius_px``) → удалить её (работает только когда pending НЕТ);
+    * иначе — ПЕРВЫЙ клик: запомнить ``size_first_point``.
+
+    В других режимах клик просто передаётся в :meth:`CalibrationState.handle_click`
     (size-точки не конфликтуют с точками линии/зоны).
+
+    :returns: список коротких рус. уведомлений (может быть пустым).
     """
-    if state.mode == "size":
-        idx = size_point_at_click(state.size_points, x_px, y_px, w, h,
-                                  radius_px=radius_px)
-        if idx is not None:
-            return remove_size_point(state, idx)
-    state.handle_click(*click_to_norm(x_px, y_px, w, h))
-    return None
+    if state.mode != "size":
+        state.handle_click(*click_to_norm(x_px, y_px, w, h))
+        return []
+    x2, y2 = click_to_norm(x_px, y_px, w, h)
+    if state.size_first_point is not None:
+        x1, y1 = state.size_first_point
+        dy = abs(y2 - y1)   # доля высоты кадра (y уже в долях 0..1)
+        if dy < MIN_SIZE_FRACTION:
+            msgs = ["слишком маленькая мерка (меньше 1% кадра) — пара сброшена"]
+        else:
+            x = round((x1 + x2) / 2.0, 4)
+            y = round((y1 + y2) / 2.0, 4)
+            state.size_points.append((x, y, round(dy, 4)))
+            msgs = [f"размер: добавлена точка (x={x:.3f}, y={y:.3f}, "
+                    f"h={int(round(dy * 100))}%)"]
+        state.size_first_point = None
+        return msgs
+    idx = size_point_at_click(state.size_points, x_px, y_px, w, h,
+                              radius_px=radius_px)
+    if idx is not None:
+        removed = remove_size_point(state, idx)
+        return [f"размер: точка удалена (x={removed[0]:.3f}, y={removed[1]:.3f}, "
+                f"h={int(round(removed[2] * 100))}%)"]
+    state.size_first_point = (x2, y2)
+    return []
 
 
 def _find_counter(cfg: Config, counter_id: str, ctype):
@@ -473,8 +541,7 @@ def load_counter_into_state(state: CalibrationState, counter) -> None:
         state.mode = "zone"
         state.zone_points = [tuple(p) for p in counter.polygon]
         state.line_points = []
-    state._size_x = None
-    state._size_y = None
+    state.size_first_point = None
 
 
 def delete_current_counter(cfg: Config, state: CalibrationState) -> str:
@@ -581,8 +648,13 @@ def polygon_area_fraction(polygon, w: int, h: int) -> float:
     return float(cv2.contourArea(pts)) / float(w * h)
 
 
+#: цвет мерок «размера» в режиме «все» (вне палитры счётчиков)
+_SHOW_ALL_SIZE_COLOR = (0, 212, 255)   # BGR — жёлто-оранжевый
+
+
 def draw_all_counters(img: np.ndarray, counters, w: int, h: int,
-                      highlight_id: Optional[str] = None) -> None:
+                      highlight_id: Optional[str] = None,
+                      size_points: Optional[list] = None) -> None:
     """Режим «все»: нарисовать ВСЕ счётчики из конфига поверх кадра (in-place).
 
     * line — отрезок A→B + точки; у середины метка
@@ -640,22 +712,44 @@ def draw_all_counters(img: np.ndarray, counters, w: int, h: int,
         ly = min(max(4, anchor[1] - 20), img.shape[0] - 26)
         draw_notification(img, label, x=lx, y=ly, size_px=size, color=color)
 
+    # мерки «размера» — вертикальные отрезки с % высоты кадра (цвет вне палитры счётчиков)
+    if size_points:
+        for p in size_points:
+            try:
+                x, y, hfrac = float(p[0]), float(p[1]), float(p[2])
+            except (IndexError, TypeError, ValueError):
+                continue
+            xc, yc = px((x, y))
+            hh = max(4, int(round(hfrac * h)))
+            cv2.line(img, (xc, yc - hh // 2), (xc, yc + hh // 2),
+                     _SHOW_ALL_SIZE_COLOR, 2, lineType=cv2.LINE_AA)
+            put_text(img, f"размер: {hfrac:.0%}", (xc + 6, max(14, yc - 8)),
+                     size_px=13, color=_SHOW_ALL_SIZE_COLOR)
 
-def counter_status_text(counter_id: str, counters) -> str:
-    """Строка статуса над кнопками: текущий счётчик и его позиция в списке."""
+
+def counter_status_text(counter_id: str, counters,
+                        scale: float = 1.0) -> str:
+    """Строка статуса над кнопками: текущий счётчик, позиция в списке и
+    текущий масштаб отображения (``scale=…x``, меняется клавишами `,`/`.`)."""
+    txt: Optional[str] = None
     if not counters:
-        return "Счётчиков нет — нажмите кнопку +линия или +зона"
-    ids = [c.id for c in counters]
-    n = len(ids)
-    if counter_id in ids:
-        i = ids.index(counter_id)
-        c = counters[i]
-        kind = "линия" if isinstance(c, LineCounterConfig) else "зона"
-        return f"Счётчик: {counter_id} ({kind}, позиция {i + 1} из {n})"
-    return f"Счётчик: {counter_id} (новый — появится в конфиге после [a])"
+        txt = "Счётчиков нет — нажмите кнопку +линия или +зона"
+    else:
+        ids = [c.id for c in counters]
+        n = len(ids)
+        if counter_id in ids:
+            i = ids.index(counter_id)
+            c = counters[i]
+            kind = "линия" if isinstance(c, LineCounterConfig) else "зона"
+            txt = f"Счётчик: {counter_id} ({kind}, позиция {i + 1} из {n})"
+        else:
+            txt = f"Счётчик: {counter_id} (новый — появится в конфиге после [a])"
+    return f"{txt}   scale={scale:g}x"
 
 
 #: Порядок и подписи кнопок панели (слева направо); name — ключ действия.
+# «−точка» скрыта из панели: конкретную мерку удаляют кликом по ней,
+# отмена последней остаётся на клавише [b].
 _BUTTON_LABELS: list[tuple[str, str]] = [
     ("line", "линия"),
     ("zone", "зона"),
@@ -667,7 +761,6 @@ _BUTTON_LABELS: list[tuple[str, str]] = [
     ("new_line", "+линия"),
     ("new_zone", "+зона"),
     ("delete", "удалить"),
-    ("undo_size", "−точка"),
     ("time", "время"),
     ("save", "сохранить"),
 ]
@@ -713,11 +806,12 @@ def hit_button(buttons: list[Button], x: int, y: int) -> Optional[str]:
 
 def draw_top_panel(img: np.ndarray, counter_id: str, counters,
                    mode: Optional[str], mask_on: bool,
-                   show_all: bool = False) -> list[Button]:
-    """Нарисовать вверху кадра статусную строку + панель кнопок; вернуть раскладку
-    для hit-test в mouse-callback. Текст — только через put_text (кириллица)."""
-    put_text(img, counter_status_text(counter_id, counters), (10, 8), size_px=20,
-             color=(255, 255, 255))
+                   show_all: bool = False, scale: float = 1.0) -> list[Button]:
+    """Нарисовать вверху кадра статусную строку (с ``scale=…x``) + панель кнопок;
+    вернуть раскладку для hit-test в mouse-callback. Текст — только через
+    put_text (кириллица)."""
+    put_text(img, counter_status_text(counter_id, counters, scale), (10, 8),
+             size_px=20, color=(255, 255, 255))
     font = 20
     buttons = layout_buttons(mode, mask_on, show_all=show_all, font_px=font)
     # узкий кадр: сужаем шрифт кнопок (не ниже 12px), чтобы вся строка помещалась
@@ -741,26 +835,54 @@ def draw_top_panel(img: np.ndarray, counter_id: str, counters,
 #: Подсказки на экране (рисуются через text_overlay.put_text — кириллица поддерживается).
 _HINTS = {
     None: ("режимы: кнопки или клавиши — [l]иния 2 клика | [z]она N кликов+Enter "
-           "| [s]ize точка (x,y)+цифра 1-9\n"
+           "| [s]ize мерка роста: 2 клика (верх/низ человека)\n"
            "счётчики: кнопки [<]/[>] (или клавиши [ ]) — смена | +линия/+зона — новый счётчик "
            "| удалить/[x] — удалить текущий счётчик\n"
            "| [m]аска движения | [v]се — все счётчики с размерами | [n/p] кадр вперёд/назад "
-           "| [t]время (seek, только файл) | [a]сохранить | [q]выход"),
+           "| [t]время (seek, только файл) | [a]сохранить | [,/.] масштаб окна 0.5-2 (только экран) | [q]выход"),
     "line": ("ЛИНИЯ: кликните точку A, затем B (порядок = направление in); "
              "повторный 'l' или кнопка «линия» — заново"),
     "zone": ("ЗОНА: кликайте углы полигона; Enter — замкнуть (>=3), "
              "'z'/кнопка «зона» — начать заново"),
-    "size": ("SIZE: кликните точку, где стоит человек (важен и x, и y), "
-             "затем цифру 1-9 (1=5% ... 9=45% высоты кадра); Enter — завершить\n"
-             "клик по существующей точке — удалить её; [b]/кнопка «−точка» — отменить последнюю"),
+    "size": ("SIZE: «мерка роста» — 2 клика: верх и низ человека в этом месте кадра\n"
+             "центр считается автоматически, рост = длина отрезка в % высоты кадра; "
+             "Enter — завершить набор\n"
+             "клик по существующей мерке (когда нет ожидающего 1-го клика) — удалить её; "
+             "[b] — отменить последнюю"),
 }
 
 
 
 
+def _dashed_line(img: np.ndarray, p1: tuple[int, int], p2: tuple[int, int],
+                 color, thickness: int = 2,
+                 dash_px: int = 8, gap_px: int = 6) -> None:
+    """Пунктирный отрезок p1→p2 (для pending-«мерки роста»; чистая функция)."""
+    x1, y1 = p1
+    x2, y2 = p2
+    dist = float(math.hypot(x2 - x1, y2 - y1))
+    if dist < 1.0:
+        return
+    dx = (x2 - x1) / dist
+    dy = (y2 - y1) / dist
+    t = 0.0
+    while t < dist:
+        seg = min(dash_px, dist - t)
+        cv2.line(img,
+                 (int(round(x1 + dx * t)), int(round(y1 + dy * t))),
+                 (int(round(x1 + dx * (t + seg))), int(round(y1 + dy * (t + seg)))),
+                 color, thickness, lineType=cv2.LINE_AA)
+        t += dash_px + gap_px
+
+
 def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
-                      mask: Optional[np.ndarray], w: int, h: int) -> np.ndarray:
-    """Отрисовка состояния калибровки на копии кадра (чистая функция)."""
+                      mask: Optional[np.ndarray], w: int, h: int,
+                      mouse_pos: Optional[tuple[int, int]] = None) -> np.ndarray:
+    """Отрисовка состояния калибровки на копии кадра (чистая функция).
+
+    ``mouse_pos`` — текущая позиция курсора (для live-превью pending «мерки роста»);
+    None — превью не рисуется.
+    """
     img = base.copy()
     if mask_on and mask is not None:
         m = cv2.applyColorMap(mask.astype(np.uint8), cv2.COLORMAP_JET)
@@ -787,16 +909,37 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
                           (0, 200, 255), 2, lineType=cv2.LINE_AA)
 
     for x_f, y_f, h_f in state.size_points:
-        # size-точка = (x_frac, y_frac, доля высоты человека): вертикальный
-        # отрезок нужной длины в точке клика (x, y) — «человек» стоит именно там
+        # ЗАВЕРШЁННАЯ «мерка роста» = (x_frac, y_frac, доля высоты человека):
+        # вертикальный отрезок длиной h*frame_h с центром в (x, y) — «человечек»,
+        # стоявший/шедший в этом месте кадра
         x = int(round(x_f * w))
         yc = max(0, min(h - 1, int(round(y_f * h))))
         seg_h = int(round(h_f * h))
         top = max(0, yc - seg_h // 2)
         bottom = min(h - 1, yc + seg_h // 2)
         cv2.line(img, (x, top), (x, bottom), (0, 255, 255), 2)
-        put_text(img, f"{int(round(h_f * 100))}%", (x + 6, max(4, yc - 8)),
+        for ep in ((x, top), (x, bottom)):
+            cv2.circle(img, ep, 3, (0, 255, 255), -1)
+        put_text(img, f"размер: {int(round(h_f * 100))}%", (x + 6, max(4, yc - 8)),
                  size_px=14, color=(0, 255, 255))
+
+    # PENDING «мерка роста»: первый клик запомнен — рисуем маркер + пунктирное
+    # превью до текущего курсора с текущей длиной (px / % высоты кадра)
+    first = getattr(state, "size_first_point", None)
+    if first is not None:
+        fx = int(round(first[0] * w))
+        fy = max(0, min(h - 1, int(round(first[1] * h))))
+        cv2.circle(img, (fx, fy), 5, (0, 165, 255), -1)
+        put_text(img, "мерка: кликните 2-ю точку (низ/верх человека)",
+                 (max(4, fx + 8), max(4, fy - 10)), size_px=14, color=(0, 165, 255))
+        if mouse_pos is not None:
+            mx, my = mouse_pos
+            _dashed_line(img, (fx, fy), (mx, my), (0, 165, 255), thickness=2)
+            len_px = abs(my - fy)
+            pct = int(round(len_px / h * 100)) if h > 0 else 0
+            put_text(img, f"{len_px}px ({pct}% кадра)",
+                     (max(4, mx + 8), max(4, my - 10)), size_px=14,
+                     color=(0, 165, 255))
 
     # подсказки внизу кадра (верх занят статусной строкой + панелью кнопок)
     hint_lines = _HINTS[state.mode].split("\n")
@@ -824,7 +967,8 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
                     counter_id: str = "main_line",
                     window_name: str = "calibrate [l/z/s/m/a/q]",
                     save_to: Optional[str | Path] = None,
-                    cache_frames: int = DEFAULT_CACHE_FRAMES) -> int:
+                    cache_frames: int = DEFAULT_CACHE_FRAMES,
+                    initial_scale: float = 1.0) -> int:
     """Интерактивная калибровка.
 
     :param save_to: если задан (например, явный --config) — результат пишется строго туда;
@@ -911,6 +1055,7 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
     saved_once = False
     pending_msgs: list[tuple[str, float]] = []  # (текст, expires_at — time.monotonic)
     buttons: list[Button] = []   # раскладка панели (обновляется каждый кадр отрисовкой)
+    scale = max(0.05, initial_scale)   # --scale: старт масштаба ОТОБРАЖЕНИЯ (клавиши `,`/`.`); обработка — в исходном
 
     def _notify(msg: str) -> None:
         """Сообщение на экране: живёт MESSAGE_TTL_SECONDS секунд."""
@@ -991,7 +1136,7 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         print(f"calibrate: {msg}")
 
     def _do_undo_size_point() -> None:
-        """[b]/кнопка «−точка» — отменить последнюю size-точку.
+        """[b] — отменить последнюю size-точку (кнопки в панели нет).
 
         Работает осмысленно только в режиме «размер»: из других режимов
         точки НЕ удаляются, а выдаётся подсказка включить режим размер.
@@ -1060,9 +1205,17 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         elif name == "save":
             _do_save()
 
+    mouse_xy = [-1, -1]   # позиция курсора (cv2.getMousePos в cv2 5.x отсутствует)
+
     def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_MOUSEMOVE:
+            mouse_xy[0], mouse_xy[1] = x, y
+            return
         if event != cv2.EVENT_LBUTTONDOWN:
             return
+        # координаты мыши — в системе МАСШТАБИРОВАННОЙ картинки: переводим обратно
+        # в координаты исходного кадра ДО hit-test кнопок и обработчиков клика
+        x, y = unscale_mouse(x, y, scale, w, h)
         # сначала — hit-test панели кнопок (только верхняя область кадра);
         # клик по кнопке НЕ передаётся в state.handle_click
         name = hit_button(buttons, x, y)
@@ -1070,10 +1223,8 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
             _do_button(name)
             return
         try:
-            removed = handle_size_click(state, x, y, w, h)
-            if removed is not None:
-                _notify(f"размер: точка удалена (x={removed[0]:.3f}, "
-                        f"y={removed[1]:.3f}, h={int(round(removed[2] * 100))}%)")
+            for msg in handle_size_click(state, x, y, w, h):
+                _notify(msg)
         except ValueError as e:
             _notify(str(e))
 
@@ -1090,9 +1241,13 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         try:
             while True:
                 base = frames[idx]
-                img = _draw_calibration(base, state, mask_on, masks[idx], w, h)
+                img = _draw_calibration(base, state, mask_on, masks[idx], w, h,
+                                        mouse_pos=unscale_mouse(mouse_xy[0], mouse_xy[1],
+                                                                scale, w, h)
+                                        if mouse_xy[0] >= 0 else None)
                 buttons = draw_top_panel(img, state.counter_id, cfg.counters,
-                                         state.mode, mask_on, show_all=show_all)
+                                         state.mode, mask_on, show_all=show_all,
+                                         scale=scale)
                 # красные сообщения — под строкой кнопок (панель заканчивается ~y=66);
                 # живут MESSAGE_TTL_SECONDS секунд
                 pending_msgs[:] = filter_expired_messages(pending_msgs, time.monotonic())
@@ -1106,13 +1261,24 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
                 if show_all:
                     # режим «все» — поверх всего: все линии/зоны из конфига с размерами;
                     # текущий счётчик совпадает по цвету с редактируемым и не дублируется криво
-                    draw_all_counters(img, cfg.counters, w, h,
-                                      highlight_id=state.counter_id)
-                cv2.imshow(window_name, img)
+                    draw_all_counters(
+                        img, cfg.counters, w, h, highlight_id=state.counter_id,
+                        size_points=(state.size_points
+                                     or [list(p) for p in cfg.size_profile.control_points]))
+                # масштаб ОТОБРАЖЕНИЯ: рисуем overlay в исходном разрешении и только
+                # перед imshow уменьшаем/увеличиваем кадр (обработка не затрагивается)
+                if scale == 1.0:
+                    disp = img
+                else:
+                    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+                    disp = cv2.resize(
+                        img, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                        interpolation=interp)
+                cv2.imshow(window_name, disp)
                 key = cv2.waitKey(1) & 0xFF
 
                 if time_input_active:
-                    # режим ввода времени имеет приоритет: цифры НЕ идут в size-режим
+                    # режим ввода времени имеет приоритет: цифры уходят только в буфер
                     if key in (ord("q"), ord("Q"), 27):
                         time_input_active = False
                         time_buf.reset()
@@ -1148,8 +1314,8 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
                     idx = (idx + 1) % len(frames)
                 elif key == ord("p"):
                     idx = (idx - 1) % len(frames)
-                elif key in tuple(ord(d) for d in "123456789") and state.mode == "size":
-                    state.set_size_height(key - ord("0"))
+                # цифры 1-9 в режиме «размер» больше не используются
+                # (рост задаётся двумя кликами «меркой роста»)
                 elif key == ord("x"):
                     _do_delete()
                 elif key == ord("b"):   # отменить последнюю size-точку (только в режиме «размер»)
@@ -1162,6 +1328,10 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
                     _begin_time_input()
                 elif key == ord("a"):
                     _do_save()
+                elif key == ord(","):   # `,` — масштаб отображения: уменьшить (циклически)
+                    scale = next_scale(scale, -1)
+                elif key == ord("."):   # `.` — масштаб отображения: увеличить (циклически)
+                    scale = next_scale(scale, 1)
         finally:
             cv2.destroyAllWindows()
     finally:

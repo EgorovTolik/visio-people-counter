@@ -170,21 +170,28 @@ class GuiPlayer:
     :param window_name: название окна.
 
     Клавиши: **пробел** — пауза/далее; **q**/**ESC** — выход; **+**/**=**,
-    **-**/**−** — скорость ×1.5 / ÷1.5 (в пределах 0.25..8).
+    **-**/**−** — скорость ×1.5 / ÷1.5 (в пределах 0.25..8); **`,`**/**`.`** —
+    масштаб ОТОБРАЖЕНИЯ пресеты 0.5/1/1.5/2 (только экран, обработка не меняется).
     """
 
     #: Имя окна — только ASCII: GNOME/GTK использует заголовок для имени файла
     #: в диалогах сохранения, и кириллица там превращается в «_».
     DEFAULT_WINDOW = ("visio-people-counter "
-                      "[space]=pause [q/ESC]=quit [+/-]=speed")
+                      "[space]=pause [q/ESC]=quit [+/-]=speed [,/.]=scale")
 
     def __init__(self, pipeline: Pipeline, speed: float = 1.0,
-                 window_name: str | None = None) -> None:
+                 window_name: str | None = None,
+                 initial_scale: float = 1.0) -> None:
+        if initial_scale <= 0:
+            raise ValueError(f"initial_scale должен быть > 0, получено {initial_scale!r}")
         self.pipeline = pipeline
         self.cfg: Config = pipeline.cfg
         self.speed: float = clamp_speed(speed)
         self.window_name = window_name or self.DEFAULT_WINDOW
         self.overlay = GuiOverlay(self.cfg.debug)
+        #: масштаб ОТОБРАЖЕНИЯ (клавиши `,`/`.`; старт — initial_scale/--scale):
+        #: применяем только перед imshow, обработка/детекция — всегда в исходном разрешении
+        self.scale: float = initial_scale
         self._stop = False
         self._paused = False
         self._last_view: np.ndarray | None = None  # удержание кадра в паузе
@@ -230,6 +237,11 @@ class GuiPlayer:
                 "Запустите без --gui — headless-подсчёт работает без окон.")
 
     # ------------------------------------------------------------------ keys
+    def _next_scale(self, direction: int) -> float:
+        """Следующий пресет масштаба отображения (логика в calibrate.next_scale)."""
+        from .calibrate import next_scale   # ленивый импорт: calibrate импортирует gui (цикл)
+        return next_scale(self.scale, direction)
+
     def _handle_key(self, key: int) -> None:
         """Клавиша cv2.waitKey (& 0xFF). Чистая логика — тестируется без окна."""
         if key in (ord("q"), ord("Q"), 27):          # q / ESC — выход
@@ -240,9 +252,24 @@ class GuiPlayer:
             self.speed = clamp_speed(self.speed * 1.5)
         elif key in (ord("-"), 109):                  # - — медленнее ÷1.5
             self.speed = clamp_speed(self.speed / 1.5)
+        elif key == ord(","):                         # `,` — масштаб отображения: уменьшить
+            self.scale = self._next_scale(-1)
+        elif key == ord("."):                         # `.` — масштаб отображения: увеличить
+            self.scale = self._next_scale(1)
+
+    def _scaled_view(self, view: np.ndarray) -> np.ndarray:
+        """Кадр для imshow: resize только при scale != 1.0 (обработка не меняется)."""
+        if self.scale == 1.0 or view is None or view.size == 0:
+            return view
+        interp = cv2.INTER_AREA if self.scale < 1.0 else cv2.INTER_LINEAR
+        h, w = view.shape[:2]
+        return cv2.resize(view, (max(1, int(round(w * self.scale))),
+                                 max(1, int(round(h * self.scale)))),
+                          interpolation=interp)
 
     def _status_text(self, proc_fps: float) -> str:
-        txt = f"speed={self.speed:.2f}x  proc={proc_fps:.0f}fps"
+        txt = (f"speed={self.speed:.2f}x  proc={proc_fps:.0f}fps  "
+               f"scale={self.scale:g}x")
         if self._paused:
             txt += "   [ПАУЗА]"
         return txt
@@ -285,7 +312,7 @@ class GuiPlayer:
         if fps <= 0:
             fps = float(self.cfg.processing.effective_fps or 25.0)
         _emit(f"GUI-режим: окно {self.window_name!r}, speed={self.speed:g}x "
-              f"(+/- ×/÷1.5, space — пауза, q/ESC — выход)")
+              f"(+/- ×/÷1.5, ,/. масштаб 0.5-2 только экран, space — пауза, q/ESC — выход)")
 
         last_proc_dt = 0.0
         try:
@@ -293,7 +320,7 @@ class GuiPlayer:
                 if self._paused:
                     # пауза: не читаем новые кадры, держим последний на экране
                     if self._last_view is not None:
-                        cv2.imshow(self.window_name, self._last_view)
+                        cv2.imshow(self.window_name, self._scaled_view(self._last_view))
                     key = cv2.waitKey(1) & 0xFF
                     self._handle_key(key)
                     continue
@@ -322,7 +349,9 @@ class GuiPlayer:
                         frame.index % max(1, int(dbg.debug_frame_step)) == 0:
                     save_debug_frame(view, dbg.save_debug_frames_dir, frame.index)
                 self._last_view = view
-                cv2.imshow(self.window_name, view)
+                # масштаб ОТОБРАЖЕНИЯ — только перед imshow (debug-кадры и обработка
+                # остаются в исходном разрешении)
+                cv2.imshow(self.window_name, self._scaled_view(view))
                 key = cv2.waitKey(1) & 0xFF
                 self._handle_key(key)
 

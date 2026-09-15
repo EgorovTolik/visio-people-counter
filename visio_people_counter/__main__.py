@@ -97,7 +97,7 @@ def cmd_count(args: argparse.Namespace) -> int:
             if not GuiPlayer.available():
                 print(f"count --gui: ОШИБКА: {GuiPlayer.unavailable_reason()}", file=sys.stderr)
                 return 1
-            player = GuiPlayer(pipe, speed=args.speed)
+            player = GuiPlayer(pipe, speed=args.speed, initial_scale=args.scale)
             return player.run()
         return pipe.run()
     except (VideoSourceError, ConfigError) as e:
@@ -125,7 +125,16 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     from .calibrate import run_calibration
     return run_calibration(args.config or "config.yaml", video=args.video,
                            counter_id=args.counter_id, save_to=args.config,
-                           cache_frames=args.cache_frames)
+                           cache_frames=args.cache_frames,
+                           initial_scale=args.scale)
+
+
+def _scale_value(s: str) -> float:
+    """--scale: начальный масштаб ОТОБРАЖЕНИЯ окна (любое значение 0.05..8)."""
+    v = float(s)
+    if not (0.05 <= v <= 8.0):
+        raise argparse.ArgumentTypeError(f"--scale: ожидалось 0.05..8, получено {s!r}")
+    return v
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -151,6 +160,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="замерять время этапов (detect/track/count) и печатать p50/p95 в финале")
     p_count.add_argument("--gui", action="store_true",
                          help="GUI-режим: окно с overlay по cfg.debug (headless — по умолчанию)")
+    p_count.add_argument("--scale", type=_scale_value, default=1.0, metavar="FLOAT",
+                         help="начальный масштаб отображения окна (--gui), напр. --scale 0.75")
     p_count.add_argument("--speed", type=_speed_value, default=1.0, metavar="FLOAT",
                          help="скорость воспроизведения в GUI 0.25..8 (по умолчанию 1.0)")
     p_count.set_defaults(func=cmd_count)
@@ -165,6 +176,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="видео для калибровки (переопределяет video.path)")
     p_cal.add_argument("--counter-id", default="main_line", metavar="ID",
                        help="id счётчика, который рисуем/добавляем (по умолчанию main_line)")
+    p_cal.add_argument("--scale", type=_scale_value, default=1.0, metavar="FLOAT",
+                       help="начальный масштаб отображения окна, напр. --scale 0.75")
     p_cal.add_argument("--cache-frames", type=_cache_frames_value, default=100,
                        metavar="N", help="сколько кадров держать в кэше листа [n/p] и "
                                          "загружать после seek ([t]) (по умолчанию 100, >= 1)")

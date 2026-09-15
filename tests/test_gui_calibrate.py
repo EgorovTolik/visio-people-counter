@@ -27,7 +27,7 @@ from visio_people_counter.calibrate import (
     delete_current_counter,
     load_counter_into_state,
     make_new_counter_id,
-    size_digit_to_fraction,
+    MIN_SIZE_FRACTION,
     SIZE_POINT_HIT_RADIUS_PX,
     handle_size_click,
     remove_size_point,
@@ -38,13 +38,16 @@ from visio_people_counter.calibrate import (
     line_length_norm,
     polygon_area_fraction,
     draw_all_counters,
+    SCALE_PRESETS,
+    next_scale,
+    unscale_mouse,
 )
 from visio_people_counter.config import (
     Config,
     LineCounterConfig,
     ZoneCounterConfig,
 )
-from visio_people_counter.gui import GuiOverlay, GuiPlayer
+from visio_people_counter.gui import GuiOverlay, GuiPlayer, clamp_speed
 from visio_people_counter.line_counter import LineCounter, ZoneCounter
 from visio_people_counter.motion_detector import Blob
 from visio_people_counter.tracker_adapter import TrackedObject
@@ -173,14 +176,6 @@ class TestCalibrationPure(unittest.TestCase):
         with self.assertRaises(ValueError):
             click_to_norm(10, 10, 0, H)
 
-    def test_size_digit_to_fraction(self):
-        self.assertEqual(size_digit_to_fraction(1), 0.05)
-        self.assertEqual(size_digit_to_fraction(2), 0.10)
-        self.assertEqual(size_digit_to_fraction(9), 0.45)
-        for bad in (0, 10, -1):
-            with self.assertRaises(ValueError):
-                size_digit_to_fraction(bad)
-
     def test_two_clicks_line_added_to_config(self):
         cfg = Config.from_dict({})
         st = CalibrationState(counter_id="main_line")
@@ -232,28 +227,85 @@ class TestCalibrationPure(unittest.TestCase):
         with self.assertRaises(ValueError):
             st.finish_zone()
 
-    def test_size_point_recorded_and_applied(self):
+    def test_size_two_clicks_makes_measure_and_applies(self):
+        """Задача 07: «мерка роста» — 2 клика (верх/низ человека) → тройка [x, y, h].
+
+        Клик №1 (120, 80) → доли (0.25, 0.25); клик №2 (360, 240) → (0.75, 0.75).
+        Центр = (0.5, 0.5), h = |0.75 − 0.25| = 0.5 (50% высоты кадра).
+        """
         cfg = Config.from_dict({})
         st = CalibrationState(counter_id="m")
         st.set_mode("size")
-        st.handle_click(0.42, 0.9)      # клик фиксирует ОБЕ координаты (важен и x, и y)
-        st.set_size_height(3)           # → 15% высоты кадра
-        self.assertEqual(st.size_points, [(0.42, 0.9, 0.15)])
+        msgs1 = handle_size_click(st, 120, 80, W, H)   # первый клик пары
+        self.assertEqual(msgs1, [])                    # уведомлений нет (просто маркер)
+        self.assertEqual(st.size_first_point, (0.25, 0.25))
+        msgs2 = handle_size_click(st, 360, 240, W, H)  # второй клик завершает пару
+        self.assertEqual(len(msgs2), 1)
+        self.assertIn("добавлена точка", msgs2[0])
+        self.assertEqual(st.size_points, [(0.5, 0.5, 0.5)])   # точные значения
+        self.assertIsNone(st.size_first_point)                # pending очищен
         apply_calibration(cfg, st)
         self.assertTrue(cfg.size_profile.enabled)
-        self.assertIn((0.42, 0.9, 0.15), cfg.size_profile.control_points)
+        self.assertIn((0.5, 0.5, 0.5), cfg.size_profile.control_points)
 
-    def test_size_click_y_is_stored(self):
-        """Регрессия задачи 05: клик в size-режиме запоминает и y (2D-профиль)."""
+    def test_size_second_click_order_does_not_matter(self):
+        """Верх/низ в любом порядке: h = |dy|, центр тот же."""
         st = CalibrationState(counter_id="m")
         st.set_mode("size")
-        st.handle_click(0.1, 0.2)
-        self.assertEqual((st._size_x, st._size_y), (0.1, 0.2))
-        st.set_size_height(5)           # → 25% высоты кадра
-        self.assertEqual(st.size_points, [(0.1, 0.2, 0.25)])
+        # сначала НИЗ (360, 240), потом ВЕРХ (120, 80) — зеркальный порядок
+        handle_size_click(st, 360, 240, W, H)
+        handle_size_click(st, 120, 80, W, H)
+        self.assertEqual(st.size_points, [(0.5, 0.5, 0.5)])
+
+    def test_size_too_small_measure_rejected(self):
+        """Мерка < 1% высоты кадра — не добавляется, уведомление, pending сброшен."""
+        st = CalibrationState(counter_id="m")
+        st.set_mode("size")
+        handle_size_click(st, 120, 80, W, H)           # (0.25, 0.25)
+        self.assertIsNotNone(st.size_first_point)
+        # второй клик: Δy = |64/320 − 80/320| = 0.05 → нет, берём 1 px по y:
+        # (0.25, 0.25) и (0.25, 0.25+<3px): на H=320 порог 1% = 3.2 px
+        msgs = handle_size_click(st, 120, 82, W, H)    # Δy = 2/320 = 0.00625 < 0.01
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("слишком маленькая мерка", msgs[0])
+        self.assertEqual(st.size_points, [])           # ничего не добавилось
+        self.assertIsNone(st.size_first_point)         # pending сброшен
+        # после сброса можно поставить новую пару заново
+        handle_size_click(st, 120, 80, W, H)
+        self.assertEqual(st.size_first_point, (0.25, 0.25))
+
+    def test_size_measure_exactly_one_percent_accepted(self):
+        """Мерка ровно = 1% высоты кадра — добавляется (порог строгий <)."""
+        st = CalibrationState(counter_id="m")
+        st.set_mode("size")
+        # H=320: 1% = 3.2 px; берём Δy = 4/320 = 0.0125 > 0.01
+        handle_size_click(st, 120, 80, W, H)
+        handle_size_click(st, 120, 84, W, H)           # (0.25, 0.25)→(0.25, 0.2625)
+        self.assertEqual(st.size_points, [(0.25, round((0.25 + 0.2625) / 2, 4), 0.0125)])
+        self.assertIsNone(st.size_first_point)
+
+    def test_size_pending_not_survive_mode_switch(self):
+        """Смена режима (set_mode) сбрасывает size_first_point."""
+        st = CalibrationState(counter_id="m")
+        st.set_mode("size")
+        handle_size_click(st, 120, 80, W, H)
+        self.assertIsNotNone(st.size_first_point)
+        st.set_mode("line")                            # выход из режима «размер»
+        self.assertIsNone(st.size_first_point)
+        st.set_mode("size")                            # повторный вход тоже чистит
+        handle_size_click(st, 100, 60, W, H)
+        st.set_mode("zone")
+        st.set_mode("size")
+        self.assertIsNone(st.size_first_point)
+
+    def test_size_finish_enter_resets_pending(self):
+        """Enter (finish_size) завершает набор и сбрасывает pending-пару."""
+        st = CalibrationState(counter_id="m")
+        st.set_mode("size")
+        handle_size_click(st, 120, 80, W, H)
+        self.assertIsNotNone(st.size_first_point)
         st.finish_size()
-        self.assertIsNone(st._size_x)
-        self.assertIsNone(st._size_y)
+        self.assertIsNone(st.size_first_point)
 
     def test_mode_switch_clears_other_geometry(self):
         st = CalibrationState(counter_id="m")
@@ -391,14 +443,13 @@ class TestButtonLayoutAndHitTest(unittest.TestCase):
         self.assertEqual([b[0] for b in btns],
                          ["line", "zone", "size", "mask", "show_all",
                           "prev", "next", "new_line", "new_zone", "delete",
-                          "undo_size", "time", "save"])
+                          "time", "save"])
         labels = {b[0]: b[1] for b in btns}
         self.assertEqual(labels["line"], "линия")
         self.assertEqual(labels["show_all"], "все")
         self.assertEqual(labels["size"], "размер")
         self.assertEqual(labels["new_line"], "+линия")
         self.assertEqual(labels["delete"], "удалить")
-        self.assertEqual(labels["undo_size"], "−точка")
         self.assertEqual(labels["time"], "время")
         self.assertEqual(labels["save"], "сохранить")
 
@@ -407,7 +458,7 @@ class TestButtonLayoutAndHitTest(unittest.TestCase):
         self.assertTrue(btns["zone"][2])
         self.assertTrue(btns["mask"][2])
         for name in ("line", "size", "show_all", "prev", "next",
-                    "new_line", "new_zone", "delete", "undo_size", "time", "save"):
+                    "new_line", "new_zone", "delete", "time", "save"):
             self.assertFalse(btns[name][2], f"{name} должен быть неактивным")
 
     def test_show_all_button_active(self):
@@ -453,7 +504,7 @@ class TestButtonLayoutAndHitTest(unittest.TestCase):
         img = np.zeros((360, 900, 3), np.uint8)
         counters = [LineCounterConfig(id="m", a=(0.1, 0.1), b=(0.9, 0.9))]
         btns = draw_top_panel(img, "m", counters, mode="line", mask_on=False)
-        self.assertEqual(len(btns), 13)   # с кнопками «все» и «−точка»
+        self.assertEqual(len(btns), 12)   # «−точка» скрыта из панели (есть [b] и клик по мерке)
         b = next(b for b in btns if b[0] == "line")
         _n, _l, active, x0, y0, x1, y1 = b
         self.assertTrue(active)
@@ -818,6 +869,32 @@ class TestCliCacheFrames(unittest.TestCase):
             run_calibration("config.yaml", video="x.mp4", cache_frames=0)
 
 
+class TestCliScale(unittest.TestCase):
+    """--scale: начальный масштаб отображения окна (count --gui / calibrate)."""
+
+    @staticmethod
+    def _parse(cmd: str, extra: list[str]):
+        from visio_people_counter.__main__ import build_parser
+        return build_parser().parse_args([cmd] + extra)
+
+    def test_default_is_one_for_count_and_calibrate(self):
+        self.assertEqual(self._parse("count", ["--gui"]).scale, 1.0)
+        self.assertEqual(self._parse("calibrate", []).scale, 1.0)
+
+    def test_arbitrary_value_accepted(self):
+        self.assertAlmostEqual(self._parse("count", ["--scale", "0.75"]).scale, 0.75)
+        self.assertAlmostEqual(self._parse("calibrate", ["--scale", "2"]).scale, 2.0)
+
+    def test_out_of_range_is_argparse_error(self):
+        for bad in ("0.01", "9", "-1"):
+            with self.assertRaises(SystemExit):
+                self._parse("calibrate", ["--scale", bad])
+
+    def test_non_numeric_is_argparse_error(self):
+        with self.assertRaises(SystemExit):
+            self._parse("count", ["--scale", "abc"])
+
+
 # ---------------------------------------------------------------------------
 # calibrate: удаление текущего счётчика (чистая функция, без окна)
 # ---------------------------------------------------------------------------
@@ -1009,10 +1086,100 @@ class TestDrawAllCounters(unittest.TestCase):
     def test_none_img_safe(self):
         draw_all_counters(None, self.COUNTERS, W, H)   # без исключений
 
+    def test_size_points_drawn(self):
+        img = np.zeros((H, W, 3), np.uint8)
+        before = img.copy()
+        draw_all_counters(img, self.COUNTERS, W, H, size_points=[[0.5, 0.5, 0.2]])
+        self.assertFalse((img == before).all(), "мерка размера должна что-то нарисовать")
+
+    def test_size_points_invalid_skipped(self):
+        img = np.zeros((H, W, 3), np.uint8)
+        draw_all_counters(img, self.COUNTERS, W, H,
+                          size_points=[[0.5], None, ["x", "y", "z"]])   # без падений
+
 
 # ---------------------------------------------------------------------------
 # calibrate: удаление отдельных/последних size-точек (чистые функции, без окна)
 # ---------------------------------------------------------------------------
+
+class TestWindowScale(unittest.TestCase):
+    """Масштаб ОТОБРАЖЕНИЯ окна 0.5/1/1.5/2, клавиши `,`/`.` — задача 08."""
+
+    def test_scale_presets(self):
+        self.assertEqual(SCALE_PRESETS, (0.5, 1.0, 1.5, 2.0))
+
+    def test_next_scale_up_full_cycle(self):
+        cur = 0.5
+        for expected in (1.0, 1.5, 2.0, 0.5):   # 0.5→1→1.5→2→0.5
+            cur = next_scale(cur, 1)
+            self.assertEqual(cur, expected)
+
+    def test_next_scale_down_cycle(self):
+        cur = 1.0
+        for expected in (0.5, 2.0, 1.5, 1.0):   # 1→0.5→2→1.5→1
+            cur = next_scale(cur, -1)
+            self.assertEqual(cur, expected)
+
+    def test_next_scale_non_preset_input(self):
+        self.assertEqual(next_scale(1.2, 1), 1.5)
+        self.assertEqual(next_scale(1.2, -1), 1.0)
+        self.assertEqual(next_scale(0.3, 1), 0.5)   # меньше всех → первый
+        self.assertEqual(next_scale(2.5, 1), 0.5)   # больше всех → цикл на первый
+
+    def test_next_scale_bad_direction(self):
+        with self.assertRaises(ValueError):
+            next_scale(1.0, 0)
+
+    def test_unscale_mouse_half_and_double(self):
+        self.assertEqual(unscale_mouse(100, 50, 0.5), (200, 100))
+        self.assertEqual(unscale_mouse(100, 50, 2.0), (50, 25))
+
+    def test_unscale_mouse_clamps_to_frame(self):
+        w, h = W, H   # 480x320
+        self.assertEqual(unscale_mouse(-10, -5, 0.5, w, h), (0, 0))
+        self.assertEqual(unscale_mouse(9999, 9999, 0.5, w, h), (w - 1, h - 1))
+
+    def test_unscale_mouse_bad_scale(self):
+        with self.assertRaises(ValueError):
+            unscale_mouse(10, 10, 0.0)
+
+    def test_counter_status_text_shows_scale(self):
+        counters = [LineCounterConfig(id="a", a=(0.1, 0.1), b=(0.9, 0.9))]
+        self.assertIn("scale=1x", counter_status_text("a", counters))
+        self.assertIn("scale=0.5x",
+                      counter_status_text("a", counters, scale=0.5))
+
+    def test_gui_player_keys_change_scale_and_status(self):
+        from types import SimpleNamespace
+        player = GuiPlayer(SimpleNamespace(cfg=Config.from_dict({})))
+        self.assertEqual(player.scale, 1.0)
+        self.assertIn("scale=1x", player._status_text(25.0))
+        player._handle_key(ord("."))    # `.` — увеличить
+        self.assertEqual(player.scale, 1.5)
+        player._handle_key(ord("."))
+        self.assertEqual(player.scale, 2.0)
+        player._handle_key(ord("."))    # цикл: > 2.0 → 0.5
+        self.assertEqual(player.scale, 0.5)
+        player._handle_key(ord(","))    # цикл: < 0.5 → 2.0
+        self.assertEqual(player.scale, 2.0)
+        self.assertIn("scale=2x", player._status_text(25.0))
+        # существующие клавиши не сломаны
+        before = player.speed
+        player._handle_key(ord("+"))
+        self.assertAlmostEqual(player.speed, clamp_speed(before * 1.5))
+        player._handle_key(ord("."))    # 2.0 → цикл на 0.5… нет: после + скорость, масштаб 2.0→0.5
+        self.assertEqual(player.scale, 0.5)
+
+    def test_gui_player_scaled_view(self):
+        from types import SimpleNamespace
+        player = GuiPlayer(SimpleNamespace(cfg=Config.from_dict({})))
+        frame = np.zeros((32, 48, 3), np.uint8)
+        self.assertIs(player._scaled_view(frame), frame)   # scale=1.0 — без копии/resize
+        player.scale = 0.5
+        self.assertEqual(player._scaled_view(frame).shape[:2], (16, 24))
+        player.scale = 2.0
+        self.assertEqual(player._scaled_view(frame).shape[:2], (64, 96))
+
 
 class TestSizePointHitAndDelete(unittest.TestCase):
     """Клик по существующей size-точке → удаление; [b]/«−точка» → отмена последней."""
@@ -1091,43 +1258,71 @@ class TestSizePointHitAndDelete(unittest.TestCase):
     # --- интеграция: клик в size-режиме (handle_size_click) ---
 
     def test_click_on_existing_point_deletes_it(self):
+        """Клик по существующей мерке БЕЗ pending → удаление (не regression)."""
         st = self._state([(0.25, 0.5, 0.2), (0.7, 0.4, 0.3)])
-        removed = handle_size_click(st, 126, 160, W, H)   # в радиусе первой точки
-        self.assertEqual(removed, (0.25, 0.5, 0.2))
+        msgs = handle_size_click(st, 126, 160, W, H)   # в радиусе первой точки
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("удалена", msgs[0])
         self.assertEqual(st.size_points, [(0.7, 0.4, 0.3)])
-        self.assertIsNone(st._size_x)                     # новая точка НЕ запомнена
-        self.assertIsNone(st._size_y)
+        self.assertIsNone(st.size_first_point)         # новая точка НЕ запомнена
+
+    def test_pending_click_completes_pair_not_delete(self):
+        """Если pending ЕСТЬ — клик завершает пару, а НЕ удаляет мерку под курсором."""
+        st = self._state([(0.25, 0.5, 0.2)])
+        handle_size_click(st, 400, 100, W, H)          # pending: (0.8333, 0.3125)
+        self.assertIsNotNone(st.size_first_point)
+        msgs = handle_size_click(st, 126, 160, W, H)   # «на» существующей мерке
+        self.assertIn("добавлена точка", msgs[0])
+        self.assertEqual(len(st.size_points), 2)       # ничего не удалено
+        self.assertIsNone(st.size_first_point)
 
     def test_click_miss_adds_pending_point(self):
         st = self._state([(0.25, 0.5, 0.2)])
-        removed = handle_size_click(st, 400, 100, W, H)   # далеко от существующей
-        self.assertIsNone(removed)
+        msgs = handle_size_click(st, 400, 100, W, H)   # далеко от существующей
+        self.assertEqual(msgs, [])
         self.assertEqual(st.size_points, [(0.25, 0.5, 0.2)])
-        # клик запомнен как нормализованная ожидающая-цифру точка (округление click_to_norm)
-        self.assertEqual((st._size_x, st._size_y), (round(400 / W, 4), round(100 / H, 4)))
+        # первый клик пары запомнен в долях кадра (округление click_to_norm)
+        self.assertEqual(st.size_first_point,
+                         (round(400 / W, 4), round(100 / H, 4)))
 
     def test_click_in_other_mode_does_not_delete_size_points(self):
         """Hit-логика size активна только в режиме «размер»."""
         st = CalibrationState(counter_id="m")
         st.set_mode("line")
         st.size_points = [(0.25, 0.5, 0.2)]
-        removed = handle_size_click(st, 120, 160, W, H)   # прямо «на» size-точке
-        self.assertIsNone(removed)
+        msgs = handle_size_click(st, 120, 160, W, H)   # прямо «на» size-точке
+        self.assertEqual(msgs, [])
         self.assertEqual(st.size_points, [(0.25, 0.5, 0.2)])   # не удалена
         self.assertEqual(st.line_points, [(0.25, 0.5)])        # клик ушёл в линию
 
-    def test_undo_size_button_in_panel_layout(self):
+    def test_draw_completed_measure_and_pending_preview(self):
+        """Рендер: завершённая «мерка» + pending-пара с пунктирным превью до курсора."""
+        from visio_people_counter.calibrate import _draw_calibration
+        st = CalibrationState(counter_id="m")
+        st.set_mode("size")
+        st.size_points = [(0.5, 0.6, 0.18)]       # «размер: 18%» — вертикальный отрезок
+        st.size_first_point = (0.2, 0.3)          # pending: ждёт второй клик
+        frame = np.zeros((H, W, 3), np.uint8)
+        out = _draw_calibration(frame, st, mask_on=False, mask=None,
+                                w=W, h=H, mouse_pos=(400, 100))
+        self.assertGreater(int((out.sum(axis=2) > 60).sum()), 100,
+                           "мерки/превью не нарисованы")
+        # без mouse_pos превью не рисуется, но код не падает
+        out2 = _draw_calibration(frame.copy(), st, mask_on=False, mask=None,
+                                 w=W, h=H)
+        self.assertIsNotNone(out2)
+
+    def test_undo_size_hidden_from_panel(self):
+        """«−точка» скрыта из панели: конкретную мерку удаляют кликом по ней, [b] остаётся."""
         btns = layout_buttons("size", False)
         names = [b[0] for b in btns]
-        self.assertIn("undo_size", names)
-        # после «удалить», до «время»/«сохранить» — раскладка не сломана
-        self.assertLess(names.index("delete"), names.index("undo_size"))
-        self.assertLess(names.index("undo_size"), names.index("time"))
-        self.assertEqual({b[0]: b[1] for b in btns}["undo_size"], "−точка")
+        self.assertNotIn("undo_size", names)
+        # «удалить» перед «время»/«сохранить» — раскладка не сломана
+        self.assertLess(names.index("delete"), names.index("time"))
         # панель не пересекается и помещается в кадр (авто-сужение работает)
         img = np.zeros((360, 480, 3), np.uint8)
         out = draw_top_panel(img, "m", [], mode="size", mask_on=False)
-        self.assertEqual(len(out), 13)
+        self.assertEqual(len(out), 12)
 
 
 if __name__ == "__main__":
