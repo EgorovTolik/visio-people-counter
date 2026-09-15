@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .config import Config
+from .config import Config, describe_frame_range
 from .line_counter import CrossingEvent
 from .video_source import is_url
 
@@ -80,6 +80,11 @@ def build_report(cfg: Config, events: Sequence[CrossingEvent], meta: RunMeta) ->
     fps = _fmt_num(meta.fps) if meta.fps else "н/д"
     lines.append(f"- длительность видео: {dur}, кадров: {meta.frames_processed}, fps: {fps}")
     lines.append(f"- обработано кадров: {meta.frames_processed}, причина остановки: {meta.reason}")
+    # интервал кадров подсчёта (processing.frame_start/frame_end; 0-based, end включительно)
+    lines.append(
+        f"- интервал кадров: "
+        f"{describe_frame_range(cfg.processing.frame_start, cfg.processing.frame_end)}"
+    )
     lines.append("")
 
     # --- итоги per-counter (по счётчикам из конфига; 0 событий → нули) ----------

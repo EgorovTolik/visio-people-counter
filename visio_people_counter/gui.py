@@ -27,10 +27,10 @@ import cv2
 import numpy as np
 
 from .config import Config, DebugConfig
+from .pipeline import Pipeline, counting_active, save_debug_frame
 from .line_counter import BaseCounter
 from .text_overlay import put_text, text_width
 from .motion_detector import Blob
-from .pipeline import Pipeline, save_debug_frame
 from .tracker_adapter import TrackedObject
 from .video_source import FfmpegPipeSource
 
@@ -68,6 +68,24 @@ apply_qt_env()
 def clamp_speed(speed: float) -> float:
     """Привести скорость к диапазону [:data:`MIN_SPEED`, :data:`MAX_SPEED`]."""
     return max(MIN_SPEED, min(MAX_SPEED, float(speed)))
+
+
+def counting_status_text(frame_index: int,
+                         frame_start: Optional[int] = None,
+                         frame_end: Optional[int] = None) -> str:
+    """Строка статуса подсчёта для GUI-окна (чистая функция, без окна).
+
+    * до старта интервала — ``подсчёт: ждём кадр N`` (N = frame_start);
+    * внутри интервала (или при отсутствии интервала) — ``""`` (как раньше);
+    * после окончания — ``подсчёт завершён (до кадра M)`` (M = frame_end).
+
+    Номера 0-based; границы включительно. Видео продолжает проигрываться.
+    """
+    if frame_start is not None and frame_index < frame_start:
+        return f"подсчёт: ждём кадр {frame_start}"
+    if frame_end is not None and frame_index > frame_end:
+        return f"подсчёт завершён (до кадра {frame_end})"
+    return ""
 
 
 def _emit(msg: str) -> None:
@@ -267,27 +285,42 @@ class GuiPlayer:
                                  max(1, int(round(h * self.scale)))),
                           interpolation=interp)
 
-    def _status_text(self, proc_fps: float) -> str:
+    def _status_text(self, proc_fps: float, frame_index: int | None = None) -> str:
         txt = (f"speed={self.speed:.2f}x  proc={proc_fps:.0f}fps  "
                f"scale={self.scale:g}x")
         if self._paused:
             txt += "   [ПАУЗА]"
+        if frame_index is not None:
+            # статус подсчёта в интервале кадров (processing.frame_start/frame_end)
+            extra = counting_status_text(
+                frame_index, self.cfg.processing.frame_start, self.cfg.processing.frame_end)
+            if extra:
+                txt += f"   {extra}"
         return txt
 
     # ------------------------------------------------------------------ run
     def _process_frame(self, frame) -> tuple[list[Blob], list[TrackedObject]]:
         """Один кадр через компоненты pipeline (аналог Pipeline.step + blobs/mask)."""
         pipe = self.pipeline
+        p = pipe.cfg.processing
+        # детектор — на КАЖДОМ кадре (обучение фона MOG2 до старта интервала);
+        # трекер/счётчики активны только внутри processing.frame_start..frame_end.
         blobs = pipe.detector.detect(frame.image, pipe.size_profile)
-        objects = pipe.tracker.update(blobs)
-        # min_lifetime_frames: в счётчики пускаем только треки, подтверждённые
-        # минимум N кадров подряд (анти-вспышка; те же правила, что в Pipeline.step)
-        min_life = int(pipe.cfg.objects.min_lifetime_frames)
-        countable = [o for o in objects if o.track_id == -1 or o.age_frames >= min_life]
+        active = counting_active(frame.index, p.frame_start, p.frame_end)
+        if active:
+            objects = pipe.tracker.update(blobs)
+        else:
+            # вне интервала: трекер НЕ обновляем (чистый список), счётчики не трогаем
+            objects = []
         events = []
-        for c in pipe.counters:
-            events.extend(c.update(countable, frame.t_wall,
-                                   t_video=frame.t_video, frame_index=frame.index))
+        if active:
+            # min_lifetime_frames: в счётчики пускаем только треки, подтверждённые
+            # минимум N кадров подряд (анти-вспышка; те же правила, что в Pipeline.step)
+            min_life = int(pipe.cfg.objects.min_lifetime_frames)
+            countable = [o for o in objects if o.track_id == -1 or o.age_frames >= min_life]
+            for c in pipe.counters:
+                events.extend(c.update(countable, frame.t_wall,
+                                       t_video=frame.t_video, frame_index=frame.index))
         # markdown-отчёт (задача 10): те же данные, что Pipeline.step копит в headless
         pipe.report_events.extend(events)
         pipe.frames_processed += 1
@@ -345,7 +378,8 @@ class GuiPlayer:
                 view = self.overlay.draw(
                     frame.image, objects=objects, blobs=blobs, mask=mask,
                     counters=pipe.counters,
-                    status_text=self._status_text(1.0 / max(1e-6, last_proc_dt)))
+                    status_text=self._status_text(
+                        1.0 / max(1e-6, last_proc_dt), frame_index=frame.index))
                 # отладочные кадры с overlay (cfg.debug.save_debug_frames_dir)
                 dbg = self.cfg.debug
                 if dbg.save_debug_frames_dir and \

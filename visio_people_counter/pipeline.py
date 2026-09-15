@@ -48,7 +48,7 @@ from typing import Optional, Union
 import cv2
 import numpy as np
 
-from .config import Config
+from .config import Config, describe_frame_range
 from .event_log import EventLog
 from .line_counter import BaseCounter, CrossingEvent, LineCounter, ZoneCounter, build_counters
 from .report import RunMeta, build_report, choose_report_path, write_report
@@ -70,6 +70,26 @@ FALLBACK_FPS = 15.0
 def _emit(msg: str) -> None:
     """Строка лога pipeline в stdout (headless: stdout — единственный канал)."""
     print(f"[pipeline] {msg}", flush=True)
+
+
+def counting_active(index: int,
+                    frame_start: Optional[int] = None,
+                    frame_end: Optional[int] = None) -> bool:
+    """Активен ли подсчёт (трекер + счётчики) на кадре ``index`` (чистая функция).
+
+    Номера 0-based; обе границы включительно. ``frame_start``/``frame_end`` —
+    из ``cfg.processing``; null = без границы:
+
+    * обе null → активен всегда;
+    * только start → ``index >= frame_start``;
+    * только end → ``index <= frame_end``;
+    * оба → ``frame_start <= index <= frame_end``.
+    """
+    if frame_start is not None and index < frame_start:
+        return False
+    if frame_end is not None and index > frame_end:
+        return False
+    return True
 
 
 def _percentile(values: list[float], q: float) -> float:
@@ -237,6 +257,14 @@ class Pipeline:
             c.reset()  # сброс last_pos/состояний треков (id трекера снова с нуля)
 
     # ------------------------------------------------------------------ per-frame step
+    def counting_active(self, index: int) -> bool:
+        """Активен ли подсчёт на кадре ``index`` (читает ``cfg.processing``).
+
+        См. :func:`counting_active`: обе границы включительно, 0-based номера.
+        """
+        p = self.cfg.processing
+        return counting_active(index, p.frame_start, p.frame_end)
+
     def step(self, frame) -> list[CrossingEvent]:
         """Обработать один кадр: detect → track → count → log. Возвращает события кадра.
 
@@ -244,20 +272,26 @@ class Pipeline:
         можно рисовать overlay через ``counter.draw(frame.image)`` по флагам ``cfg.debug``.
         """
         t0 = time.monotonic()
+        # детектор — на КАЖДОМ кадре (обучение фона MOG2; интервал не влияет).
         blobs = self.detector.detect(frame.image, self.size_profile)
         t1 = time.monotonic()
-        objects = self.tracker.update(blobs)
+        if self.counting_active(frame.index):
+            objects = self.tracker.update(blobs)
+        else:
+            # вне интервала: трекер НЕ обновляем — чистый список, старые треки не
+            # «проживают» до старта; счётчики событие получать не будут.
+            objects = []
         t2 = time.monotonic()
 
-        # objects.min_lifetime_frames: подтверждённый трек попадает в счётчики,
-        # только когда наблюдался минимум N кадров подряд (анти-вспышка/дубль).
-        min_life = int(self.cfg.objects.min_lifetime_frames)
-        countable = [o for o in objects if o.track_id == -1 or o.age_frames >= min_life]
-
         events: list[CrossingEvent] = []
-        for c in self.counters:
-            events.extend(c.update(countable, frame.t_wall,
-                                   t_video=frame.t_video, frame_index=frame.index))
+        if self.counting_active(frame.index):
+            # objects.min_lifetime_frames: подтверждённый трек попадает в счётчики,
+            # только когда наблюдался минимум N кадров подряд (анти-вспышка/дубль).
+            min_life = int(self.cfg.objects.min_lifetime_frames)
+            countable = [o for o in objects if o.track_id == -1 or o.age_frames >= min_life]
+            for c in self.counters:
+                events.extend(c.update(countable, frame.t_wall,
+                                       t_video=frame.t_video, frame_index=frame.index))
         self.report_events.extend(events)
         if events:
             self.event_log.log_events(events)
@@ -314,6 +348,8 @@ class Pipeline:
         print(f"причина остановки : {reason}", flush=True)
         print(f"длительность      : {self.duration_s:.1f} c (wall)", flush=True)
         print(f"обработано кадров : {self.frames_processed}", flush=True)
+        p = self.cfg.processing
+        print(f"интервал кадров   : {describe_frame_range(p.frame_start, p.frame_end)}", flush=True)
         fps = f"avg={self.avg_fps:.1f} ema={self.ema_fps:.1f}"
         if self.last_lag_s is not None:
             fps += f" lag_last={self.last_lag_s:+.2f}s lag_max={self.max_lag_s:.2f}s"

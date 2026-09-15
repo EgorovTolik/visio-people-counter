@@ -728,9 +728,12 @@ def draw_all_counters(img: np.ndarray, counters, w: int, h: int,
 
 
 def counter_status_text(counter_id: str, counters,
-                        scale: float = 1.0) -> str:
-    """Строка статуса над кнопками: текущий счётчик, позиция в списке и
-    текущий масштаб отображения (``scale=…x``, меняется клавишами `,`/`.`)."""
+                        scale: float = 1.0,
+                        frame_index: Optional[int] = None) -> str:
+    """Строка статуса над кнопками: текущий счётчик, позиция в списке,
+    текущий масштаб отображения (``scale=…x``, меняется клавишами `,`/`.`)
+    и номер текущего кадра (``кадр N``, 0-based — совпадает с индексом
+    ``processing.frame_start/frame_end`` для задания интервала подсчёта)."""
     txt: Optional[str] = None
     if not counters:
         txt = "Счётчиков нет — нажмите кнопку +линия или +зона"
@@ -744,6 +747,8 @@ def counter_status_text(counter_id: str, counters,
             txt = f"Счётчик: {counter_id} ({kind}, позиция {i + 1} из {n})"
         else:
             txt = f"Счётчик: {counter_id} (новый — появится в конфиге после [a])"
+    if frame_index is not None:
+        txt += f"   кадр {frame_index}"
     return f"{txt}   scale={scale:g}x"
 
 
@@ -806,11 +811,13 @@ def hit_button(buttons: list[Button], x: int, y: int) -> Optional[str]:
 
 def draw_top_panel(img: np.ndarray, counter_id: str, counters,
                    mode: Optional[str], mask_on: bool,
-                   show_all: bool = False, scale: float = 1.0) -> list[Button]:
-    """Нарисовать вверху кадра статусную строку (с ``scale=…x``) + панель кнопок;
-    вернуть раскладку для hit-test в mouse-callback. Текст — только через
-    put_text (кириллица)."""
-    put_text(img, counter_status_text(counter_id, counters, scale), (10, 8),
+                   show_all: bool = False, scale: float = 1.0,
+                   frame_index: Optional[int] = None) -> list[Button]:
+    """Нарисовать вверху кадра статусную строку (с ``scale=…x`` и ``кадр N``)
+    + панель кнопок; вернуть раскладку для hit-test в mouse-callback.
+    Текст — только через put_text (кириллица)."""
+    put_text(img, counter_status_text(counter_id, counters, scale,
+                                      frame_index=frame_index), (10, 8),
              size_px=20, color=(255, 255, 255))
     font = 20
     buttons = layout_buttons(mode, mask_on, show_all=show_all, font_px=font)
@@ -1027,12 +1034,14 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
     detector = MotionDetector(cfg)   # для 'm' — live-маска движения
     frames: list[np.ndarray] = []
     masks: list[Optional[np.ndarray]] = []
+    frame_indices: list[int] = []   # ГЛОБАЛЬНЫЕ номера кадров (0-based) — для статуса «кадр N»
 
     def _load_cache() -> int:
         """Загрузить до cache_frames кадров от ТЕКУЩЕЙ позиции источника с масками;
-        ЗАМЕНЯЕТ списки frames/masks. Возвращает число загруженных кадров."""
+        ЗАМЕНЯЕТ списки frames/masks/frame_indices. Возвращает число загруженных кадров."""
         frames.clear()
         masks.clear()
+        frame_indices.clear()
         while len(frames) < cache_frames:
             fr = pipe.source.read()
             if fr is None:
@@ -1040,6 +1049,7 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
             detector.detect(fr.image)
             frames.append(fr.image.copy())
             masks.append(getattr(detector, "last_mask", None))
+            frame_indices.append(fr.index)
         return len(frames)
 
     # seek (клавиша [t]/кнопка «время») возможен только для файла: у ffmpeg-пайпа
@@ -1247,7 +1257,9 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
                                         if mouse_xy[0] >= 0 else None)
                 buttons = draw_top_panel(img, state.counter_id, cfg.counters,
                                          state.mode, mask_on, show_all=show_all,
-                                         scale=scale)
+                                         scale=scale,
+                                         frame_index=(frame_indices[idx]
+                                                      if idx < len(frame_indices) else None))
                 # красные сообщения — под строкой кнопок (панель заканчивается ~y=66);
                 # живут MESSAGE_TTL_SECONDS секунд
                 pending_msgs[:] = filter_expired_messages(pending_msgs, time.monotonic())

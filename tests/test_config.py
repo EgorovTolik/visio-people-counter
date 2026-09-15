@@ -26,6 +26,8 @@ class TestConfigLoad(unittest.TestCase):
         self.assertEqual(cfg.video.hls.bad_read_threshold, 10)
         self.assertEqual(cfg.processing.effective_fps, 0.0)
         self.assertEqual(cfg.processing.max_width, 0)
+        self.assertIsNone(cfg.processing.frame_start)
+        self.assertIsNone(cfg.processing.frame_end)
         self.assertEqual(cfg.motion.method, "mog2")
         self.assertEqual(cfg.motion.morph_open, (3, 3))
         self.assertEqual(cfg.motion.morph_close, (9, 15))
@@ -217,6 +219,86 @@ class TestConfigDefault(unittest.TestCase):
             Config.save(cfg, p)
             loaded = Config.load(p)
         self.assertEqual(loaded.to_dict(), cfg.to_dict())
+
+
+class TestProcessingFrameRange(unittest.TestCase):
+    """processing.frame_start/frame_end: null/null, только start/end, ошибки."""
+
+    @staticmethod
+    def _load(frame_start="__omit__", frame_end="__omit__") -> Config:
+        processing: dict = {}
+        if frame_start != "__omit__":
+            processing["frame_start"] = frame_start
+        if frame_end != "__omit__":
+            processing["frame_end"] = frame_end
+        return Config.from_dict({
+            "video": {"type": "file", "path": "x.mp4"},
+            "processing": processing,
+        })
+
+    def test_both_null_default(self):
+        cfg = self._load(None, None)
+        self.assertIsNone(cfg.processing.frame_start)
+        self.assertIsNone(cfg.processing.frame_end)
+
+    def test_missing_keys_are_none(self):
+        cfg = self._load()
+        self.assertIsNone(cfg.processing.frame_start)
+        self.assertIsNone(cfg.processing.frame_end)
+
+    def test_only_start(self):
+        cfg = self._load(100, None)
+        self.assertEqual(cfg.processing.frame_start, 100)
+        self.assertIsNone(cfg.processing.frame_end)
+
+    def test_only_end_inclusive_bound_kept(self):
+        cfg = self._load(None, 250)
+        self.assertIsNone(cfg.processing.frame_start)
+        self.assertEqual(cfg.processing.frame_end, 250)
+
+    def test_both_equal_ok(self):
+        cfg = self._load(42, 42)
+        self.assertEqual((cfg.processing.frame_start, cfg.processing.frame_end), (42, 42))
+
+    def test_zero_is_valid(self):
+        cfg = self._load(0, 0)
+        self.assertEqual(cfg.processing.frame_start, 0)
+        self.assertEqual(cfg.processing.frame_end, 0)
+
+    def test_start_greater_than_end_raises(self):
+        with self.assertRaises(ConfigError) as ctx:
+            self._load(250, 100)
+        self.assertIn("frame_start", str(ctx.exception))
+
+    def test_negative_raises(self):
+        for kw in ({"frame_start": -1}, {"frame_end": -5}):
+            with self.assertRaises(ConfigError) as ctx:
+                self._load(**kw)
+            self.assertIn(">= 0", str(ctx.exception))
+
+    def test_non_int_raises(self):
+        for bad in (1.5, "100", True, [100]):
+            with self.assertRaises(ConfigError) as ctx:
+                self._load(bad, None)
+            self.assertIn("processing.frame_start", str(ctx.exception))
+
+    def test_unknown_key_still_rejected(self):
+        with self.assertRaises(ConfigError) as ctx:
+            Config.from_dict({
+                "video": {"type": "file", "path": "x.mp4"},
+                "processing": {"frame_startt": 100},
+            })
+        self.assertIn("неизвестные ключи", str(ctx.exception))
+
+    def test_save_load_roundtrip_with_range(self):
+        import tempfile
+        cfg = self._load(50, 120)
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "config.yaml"
+            Config.save(cfg, p)
+            loaded = Config.load(p)
+        self.assertEqual(loaded.processing.frame_start, 50)
+        self.assertEqual(loaded.processing.frame_end, 120)
 
 
 if __name__ == "__main__":

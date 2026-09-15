@@ -15,7 +15,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 
@@ -76,6 +76,18 @@ def _get_int(d: dict, key: str, path: str, default: int) -> int:
     v = d[key]
     # bool — подкласс int в Python; явно не принимаем.
     _require(isinstance(v, int) and not isinstance(v, bool), f"{path}.{key}", "int", v)
+    return v
+
+
+def _get_optional_int(d: dict, key: str, path: str) -> Optional[int]:
+    """Целое >= 0 или null/отсутствует (→ None). bool не принимаем."""
+    if key not in d or d[key] is None:
+        return None
+    v = d[key]
+    # bool — подкласс int в Python; явно не принимаем.
+    _require(isinstance(v, int) and not isinstance(v, bool), f"{path}.{key}", "int >= 0 или null", v)
+    if v < 0:
+        raise ConfigError(f"{path}.{key}: ожидалось целое >= 0 (номер кадра, 0-based), получено {v!r}")
     return v
 
 
@@ -270,21 +282,57 @@ class VideoConfig:
 
 @dataclass
 class ProcessingConfig:
-    """Параметры обработки кадров."""
+    """Параметры обработки кадров.
+
+    ``frame_start``/``frame_end`` — интервал КАДРОВ (0-based номера, совпадают
+    с индексом кадра источника/GUI), в котором работают трекер и счётчики;
+    детектор при этом обрабатывает ВСЕ кадры (обучение фона MOG2). Семантика:
+    обе null — подсчёт на всём видео; только ``frame_start`` — с него до конца;
+    только ``frame_end`` — от начала до него включительно; обе —
+    ``frame_start <= index <= frame_end`` (обе границы включительно).
+    """
     effective_fps: float = 0             # 0 = нативный fps источника
     max_width: int = 0                   # даунскейл до ширины; 0 = как в источнике
+    frame_start: Optional[int] = None    # первый кадр подсчёта (0-based, включительно); null = без границы
+    frame_end: Optional[int] = None      # последний кадр подсчёта (0-based, включительно); null = до конца
 
     @classmethod
     def from_dict(cls, d: Any) -> "ProcessingConfig":
         d = _as_dict(d, "processing")
-        _check_unknown_keys(d, {"effective_fps", "max_width"}, "processing")
+        _check_unknown_keys(
+            d, {"effective_fps", "max_width", "frame_start", "frame_end"}, "processing"
+        )
         eff = _get_float(d, "effective_fps", "processing", 0.0)
         if eff < 0:
             raise ConfigError(f"processing.effective_fps: ожидалось >= 0, получено {eff!r}")
         mw = _get_int(d, "max_width", "processing", 0)
         if mw < 0:
             raise ConfigError(f"processing.max_width: ожидалось >= 0 (px), получено {mw!r}")
-        return cls(effective_fps=eff, max_width=mw)
+        fs = _get_optional_int(d, "frame_start", "processing")
+        fe = _get_optional_int(d, "frame_end", "processing")
+        if fs is not None and fe is not None and fs > fe:
+            raise ConfigError(
+                f"processing.frame_start={fs} > processing.frame_end={fe}: "
+                f"ожидалось frame_start <= frame_end (номера кадров 0-based, обе границы включительно)"
+            )
+        return cls(effective_fps=eff, max_width=mw, frame_start=fs, frame_end=fe)
+
+
+def describe_frame_range(frame_start: Optional[int], frame_end: Optional[int]) -> str:
+    """Человекочитаемый интервал кадров для финальной сводки и markdown-отчёта.
+
+    * обе null → ``весь``;
+    * только start → ``100–конец (подсчёт)``;
+    * только end → ``начало–250 (подсчёт)``;
+    * оба → ``100–250 (подсчёт)``.
+
+    Номера 0-based; ``frame_end`` — включительно.
+    """
+    if frame_start is None and frame_end is None:
+        return "весь"
+    s = "начало" if frame_start is None else str(frame_start)
+    e = "конец" if frame_end is None else str(frame_end)
+    return f"{s}–{e} (подсчёт)"
 
 
 @dataclass
