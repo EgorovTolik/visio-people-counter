@@ -336,6 +336,14 @@ def apply_calibration(cfg: Config, state: CalibrationState) -> list[str]:
         a, b = state.line_points
         c = _find_counter(cfg, cid, LineCounterConfig)
         if c is None:
+            # защита от дубля: id занят счётчиком ДРУГОГО типа — переименовываем,
+            # а не дублируем (дублирующиеся id ломают Config.load)
+            if any(x.id == cid for x in cfg.counters):
+                new_id = make_new_counter_id({x.id for x in cfg.counters}, "line")
+                changed.append(f"ВНИМАНИЕ: id {cid!r} уже занят другим счётчиком — "
+                               f"линия добавлена как {new_id!r}")
+                state.counter_id = new_id
+                cid = new_id
             cfg.counters.append(LineCounterConfig(id=cid, a=a, b=b))
             changed.append(f"counters: добавлен line-счётчик {cid!r} (a={a}, b={b})")
         else:
@@ -347,6 +355,13 @@ def apply_calibration(cfg: Config, state: CalibrationState) -> list[str]:
         poly = list(state.zone_points)
         c = _find_counter(cfg, cid, ZoneCounterConfig)
         if c is None:
+            # защита от дубля: id занят счётчиком ДРУГОГО типа — переименовываем
+            if any(x.id == cid for x in cfg.counters):
+                new_id = make_new_counter_id({x.id for x in cfg.counters}, "zone")
+                changed.append(f"ВНИМАНИЕ: id {cid!r} уже занят другим счётчиком — "
+                               f"зона добавлена как {new_id!r}")
+                state.counter_id = new_id
+                cid = new_id
             cfg.counters.append(ZoneCounterConfig(id=cid, polygon=poly))
             changed.append(f"counters: добавлен zone-счётчик {cid!r} "
                            f"(полигон {len(poly)} точек)")
@@ -415,6 +430,29 @@ def make_new_counter_id(existing_ids, kind: str) -> str:
     while f"{kind}_{n}" in taken:
         n += 1
     return f"{kind}_{n}"
+
+
+def ensure_counter_kind(cfg: Config, state: "CalibrationState", kind: str) -> Optional[str]:
+    """Не дать рисовать тип ``kind`` поверх счётчика другого типа.
+
+    Если текущий ``state.counter_id`` уже есть в ``cfg.counters`` как ДРУГОЙ тип
+    (например, линия line_1, а включили режим «зона») — создаётся новый pending-счётчик
+    со свободным id нужного типа, и state переключается на него.
+
+    :returns: новый id, если создан; None — текущий счётчик подходит (или его ещё нет в cfg).
+    :raises ValueError: kind не line/zone.
+    """
+    if kind not in ("line", "zone"):
+        raise ValueError(f"тип счётчика: ожидалось line/zone, получено {kind!r}")
+    current = next((c for c in cfg.counters if c.id == state.counter_id), None)
+    if current is None:
+        return None
+    cur_kind = "line" if isinstance(current, LineCounterConfig) else "zone"
+    if cur_kind == kind:
+        return None
+    new_id = make_new_counter_id({c.id for c in cfg.counters}, kind)
+    state.counter_id = new_id
+    return new_id
 
 
 def load_counter_into_state(state: CalibrationState, counter) -> None:
@@ -985,12 +1023,20 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         except (ConfigError, OSError) as e:
             _notify(f"ошибка записи: {e}")
 
+    def _set_draw_mode(kind: str) -> None:
+        """Переключить режим рисования; если текущий счётчик другого типа — новый id."""
+        new_id = ensure_counter_kind(cfg, state, kind)
+        state.set_mode(kind)
+        if new_id is not None:
+            what = {"line": "линию", "zone": "зону"}[kind]
+            _notify(f"текущий счётчик — другого типа: создан новый {new_id} для {what}")
+
     def _do_button(name: str) -> None:
         nonlocal mask_on, show_all
         if name == "line":
-            state.set_mode("line")
+            _set_draw_mode("line")
         elif name == "zone":
-            state.set_mode("zone")
+            _set_draw_mode("zone")
         elif name == "size":
             state.set_mode("size")
         elif name == "mask":
@@ -1080,9 +1126,9 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
                 elif key in (ord("q"), ord("Q"), 27):
                     break
                 elif key == ord("l"):
-                    state.set_mode("line")
+                    _set_draw_mode("line")
                 elif key == ord("z"):
-                    state.set_mode("zone")
+                    _set_draw_mode("zone")
                 elif key == ord("s"):
                     state.set_mode("size")
                 elif key == 13:  # Enter — замкнуть зону / завершить size-точки

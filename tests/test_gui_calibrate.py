@@ -495,6 +495,58 @@ class TestConfigRoundtrip(unittest.TestCase):
 # headless: available() без исключений и без окна
 # ---------------------------------------------------------------------------
 
+class TestCounterKindGuard(unittest.TestCase):
+    """Один id — один счётчик: нельзя нарисовать зону под id существующей линии."""
+
+    def _cfg_with_line1(self):
+        from visio_people_counter.config import Config, LineCounterConfig
+        cfg = Config.default()
+        cfg.counters = [LineCounterConfig(id="line_1", a=(0.1, 0.5), b=(0.9, 0.5))]
+        return cfg
+
+    def test_ensure_same_kind_no_change(self):
+        from visio_people_counter.calibrate import CalibrationState, ensure_counter_kind
+        cfg = self._cfg_with_line1()
+        st = CalibrationState(counter_id="line_1")
+        self.assertIsNone(ensure_counter_kind(cfg, st, "line"))
+        self.assertEqual(st.counter_id, "line_1")
+
+    def test_ensure_other_kind_creates_new_id(self):
+        from visio_people_counter.calibrate import CalibrationState, ensure_counter_kind
+        cfg = self._cfg_with_line1()
+        st = CalibrationState(counter_id="line_1")
+        new_id = ensure_counter_kind(cfg, st, "zone")
+        self.assertEqual(new_id, "zone_1")
+        self.assertEqual(st.counter_id, "zone_1")
+
+    def test_ensure_bad_kind_raises(self):
+        from visio_people_counter.calibrate import CalibrationState, ensure_counter_kind
+        cfg = self._cfg_with_line1()
+        with self.assertRaises(ValueError):
+            ensure_counter_kind(cfg, CalibrationState(counter_id="line_1"), "size")
+
+    def test_apply_does_not_duplicate_id(self):
+        """Регрессия: зона, нарисованная под id линии, не создаёт дубль id."""
+        import tempfile
+        from pathlib import Path
+        from visio_people_counter.calibrate import (
+            CalibrationState, apply_calibration)
+        from visio_people_counter.config import Config
+        cfg = self._cfg_with_line1()
+        st = CalibrationState(counter_id="line_1")
+        st.set_mode("zone")
+        st.zone_points = [(0.3, 0.2), (0.9, 0.5), (0.4, 0.8)]
+        changed = apply_calibration(cfg, st)
+        ids = [c.id for c in cfg.counters]
+        self.assertEqual(len(ids), len(set(ids)), f"дубли id: {ids}, diff: {changed}")
+        # roundtrip: конфиг сохранился и снова читается (Config.load проверяет дубли)
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "c.yaml"
+            Config.save(cfg, p)
+            cfg2 = Config.load(p)
+            self.assertEqual(len(cfg2.counters), 2)
+
+
 class TestClampSeekTime(unittest.TestCase):
     """seek за конец файла → «конец минус cache_frames», иначе — без изменений."""
 
