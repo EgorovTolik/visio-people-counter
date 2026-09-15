@@ -193,7 +193,7 @@ config.example.yaml     # эталон схемы конфигурации
 | `video_source.py` | FileSource (cv2), FfmpegPipeSource (ffmpeg-pipe + watchdog переподключения) | [11](pi-research/11-task-report.md) |
 | `motion_detector.py`, `size_profile.py` | MOG2/KNN + тени/морфология/фильтры → Blob'ы; size-профиль по контрольным точкам | [12](pi-research/12-task-report.md) |
 | `tracker_adapter.py` | Blob'ы ↔ `sv.Detections(confidence=None)` → SORT/ByteTrack/BoTSORT, устойчивые `track_id`, `reset()` | [13](pi-research/13-task-report.md) |
-| `line_counter.py`, `event_log.py` | LineCounter + ZoneCounter, антидубль; JSONL-лог событий и сводки | [14](pi-research/14-task-report.md) |
+| `line_counter.py`, `event_log.py` | LineCounter + ZoneCounter (зона: пересечения границы И появления треков внутри, задача 09), антидубль; JSONL-лог событий и сводки | [14](pi-research/14-task-report.md) |
 | `pipeline.py` | главный цикл: источник → детекция → трекер → счётчики, тайминги/fps/lag, сводки, SIGINT, --bench | [15](pi-research/15-task-report.md) |
 | `gui.py`, `calibrate.py` | GUI-режим (--gui/--speed, overlay) и мышиная калибровка линии/зоны/size-точек → config.yaml | [16](pi-research/16-task-report.md) |
 

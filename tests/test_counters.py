@@ -12,6 +12,7 @@
 * min_global_gap_s: два события < 0.3 с друг от друга → второе отброшено;
 * неподтверждённый трек (track_id=-1) не считается;
 * зона: вход/выход полигона, движение внутри без пересечения границы — 0;
+  появление нового трека ВНУТРИ зоны → событие "in" (задача 09);
   count_mode=total суммирует оба направления;
 * EventLog: JSONL-файл корректен (json.loads по строкам), агрегаты сходятся.
 """
@@ -203,6 +204,67 @@ class TestZoneCounter(unittest.TestCase):
         self.assertEqual(zc.update([make_obj(-1, 300, 370)], t_wall=0.0), [])
         self.assertEqual(zc.update([make_obj(-1, 450, 370)], t_wall=0.1), [])
         self.assertEqual(zc.counters["total"], 0)
+
+
+class TestZoneCounterInsideAppearance(unittest.TestCase):
+    """Задача 09: новый трек, впервые появившийся ВНУТРИ зоны → событие "in".
+
+    Полигон (как в TestZoneCounter): x 352..608, y 288..456; самая длинная сторона
+    256 px → порог min_global_gap_s по расстоянию = 0.5 * 256 = 128 px.
+    """
+
+    def _zone(self, **overrides) -> ZoneCounter:
+        t = {
+            "id": "test_zone",
+            "type": "zone",
+            "polygon": [(0.55, 0.6), (0.95, 0.6), (0.95, 0.95), (0.55, 0.95)],
+            "count_mode": "both",
+            "cooldown_s": 0.5,
+            "min_global_gap_s": 0.3,
+        }
+        t.update(overrides)
+        return ZoneCounter(ZoneCounterConfig(**t), w=W, h=H)
+
+    def test_appearance_inside_counts_in_at_object_position(self):
+        # трек впервые появляется уже внутри → ровно 1 событие "in" в точке объекта
+        zc = self._zone()
+        evs = zc.update([make_obj(1, 450, 370)], t_wall=0.0, frame_index=3)
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0].direction, "in")
+        self.assertEqual(evs[0].track_id, 1)
+        self.assertEqual(evs[0].frame_index, 3)
+        self.assertAlmostEqual(evs[0].x_px, 450.0, delta=0.1)
+        self.assertAlmostEqual(evs[0].y_px, 370.0, delta=0.1)
+        self.assertEqual(zc.counters, {"in": 1, "out": 0, "total": 1})
+
+    def test_appearance_outside_then_boundary_entry(self):
+        # появился снаружи → событий нет; потом зашёл через границу → "in"
+        zc = self._zone()
+        evs = []
+        evs += zc.update([make_obj(1, 300, 370)], t_wall=0.0)   # снаружи — тишина
+        self.assertEqual(evs, [])
+        evs += zc.update([make_obj(1, 450, 370)], t_wall=0.1)   # пересёк границу
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0].direction, "in")
+        self.assertEqual(zc.counters["total"], 1)
+
+    def test_two_tracks_inside_same_frame_one_event(self):
+        # два новых трека в одном кадре, рядом внутри (< 128 px) → только ОДНО событие
+        zc = self._zone()
+        evs = zc.update([make_obj(1, 450, 370), make_obj(2, 490, 370)], t_wall=0.0)
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(zc.counters["total"], 1)
+
+    def test_inside_appearance_then_exit_gives_in_and_out(self):
+        # появился внутри → "in"; вышел → "out"; всего ровно 1 in + 1 out
+        zc = self._zone()
+        evs = []
+        evs += zc.update([make_obj(1, 450, 370)], t_wall=0.0)   # внутри → "in"
+        evs += zc.update([make_obj(1, 480, 390)], t_wall=0.2)   # ходит внутри → тишина
+        evs += zc.update([make_obj(1, 300, 370)], t_wall=0.6)   # вышел → "out"
+        dirs = [e.direction for e in evs]
+        self.assertEqual(dirs, ["in", "out"])
+        self.assertEqual(zc.counters, {"in": 1, "out": 1, "total": 2})
 
 
 class TestCrossingEvent(unittest.TestCase):

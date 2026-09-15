@@ -53,9 +53,15 @@
    линии внутри 0.3 c не глушат друг друга).
 
 ZoneCounter: полигон, point-in-polygon (cv2.pointPolygonTest) по позиции трека;
-``"in"`` = снаружи→внутрь, ``"out"`` = внутрь→снаружу. Антидубль тот же: per-track
-cooldown + global gap (масштаб h_local для зоны = длина самой длинной стороны полигона).
-Блока буфера вокруг границы нет (в конфиге зоны нет buffer_width_scale — по ТЗ задачи 14).
+``"in"`` = снаружи→внутрь ИЛИ **появление нового трека уже внутри** (человек стоял в
+зоне до старта детекции / появился внутри кадра в середине видео / трекер сломал id и
+новый id возник внутри — новый id посчитается как повторный вход; mitigation:
+``tracker.lost_track_buffer``, cooldown), ``"out"`` = внутрь→снаружу. Антидубль тот же:
+per-track cooldown + global gap (масштаб h_local для зоны = длина самой длинной стороны
+полигона); при первом появлении per-track cooldown тривиально не применяется (у трека ещё
+нет last_event_t), но ``min_global_gap_s`` ОБЯЗАТЕЛЬНО — два новых трека, возникших в
+одном кадре рядом, дают одно событие. Блока буфера вокруг границы нет (в конфиге зоны нет
+buffer_width_scale — по ТЗ задачи 14).
 
 ``count_mode`` влияет только на представление ``counters``: "both" — отдельно in/out,
 "total" — общий счёт. Сами события обоих направлений фиксируются и логируются всегда.
@@ -341,11 +347,17 @@ class LineCounter(BaseCounter):
 # ---------------------------------------------------------------------------
 
 class ZoneCounter(BaseCounter):
-    """Счётчик по полигону: "in" = снаружи→внутрь, "out" = внутрь→снаружу.
+    """Счётчик по полигону: "in" = снаружи→внутрь ИЛИ появление нового трека внутри.
 
     Point-in-polygon — ``cv2.pointPolygonTest`` по позиции трека (cx, cy).
     Точка события — пересечение отрезка prev→cur с ближайшей стороной полигона
-    (если не находится — позиция трека в кадре обнаружения).
+    (если не находится — позиция трека в кадре обнаружения); для «появления внутри»
+    — позиция объекта в кадре первого появления.
+
+    Задача 09: если трек впервые появляется ВНУТРИ зоны (уже стоял при старте видео,
+    возник внутри кадра или трекер сломал id), формируется событие ``direction="in"``.
+    Пересечения границы и "out" — как раньше. Антидубль общий (``_check_boundary``):
+    per-track cooldown + ``min_global_gap_s`` по масштабу зоны.
     """
 
     def __init__(self, cfg: ZoneCounterConfig, w: int, h: int) -> None:
@@ -389,6 +401,16 @@ class ZoneCounter(BaseCounter):
                 st = _TrackState(last_pos=(float(obj.cx), float(obj.cy)))
                 st.last_inside = self._inside(cur)
                 self._tracks[obj.track_id] = st
+                # Задача 09: первое появление ВНУТРИ зоны — событие "in"
+                # (человек уже стоял в зоне / появился внутри кадра / новый id после
+                # поломки трека). prev == cur, поэтому точка события = позиция объекта,
+                # а антидубль идёт через общий _check_boundary (min_global_gap_s по
+                # масштабу зоны; per-track cooldown не применяется — last_event_t None).
+                if st.last_inside:
+                    ev = self._check_boundary(st, obj.track_id, cur, True,
+                                              t_wall, t_video, frame_index)
+                    if ev is not None:
+                        events.append(ev)
             else:
                 inside = self._inside(cur)
                 if st.last_inside is not None and inside != st.last_inside:
