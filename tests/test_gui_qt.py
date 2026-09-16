@@ -207,6 +207,33 @@ else:
             self.assertIsNone(ctrl._pipe)   # closeEvent → ctrl.close(): источник закрыт
 
 
+    class TestCanvasPaint(_QtBase):
+        """Регрессия: canvas реально рисует кадр (paintEvent), а не белый фон."""
+
+        def _dark_pixel_exists(self, win) -> bool:
+            img = win.canvas.grab().toImage()
+            w, h = img.width(), img.height()
+            for x in range(4, max(5, w - 4), max(1, w // 12)):
+                c = img.pixelColor(x, max(0, h - 8))
+                if min(c.red(), c.green(), c.blue()) < 240:
+                    return True
+            return False
+
+        def test_frame_is_painted_not_white(self):
+            win = self._open_window()
+            win.tick()   # первый кадр на canvas
+            win.canvas.repaint()
+            self.assertTrue(self._dark_pixel_exists(win),
+                            "нижняя полоса кадра белая — кадр не отрисован (нет paintEvent?)")
+
+        def test_black_before_first_frame(self):
+            win = self._open_window()   # тиков ещё не было
+            win.canvas.repaint()
+            img = win.canvas.grab().toImage()
+            c = img.pixelColor(img.width() // 2, img.height() // 2)
+            self.assertLess(max(c.red(), c.green(), c.blue()), 30)   # чёрный фон
+
+
     class TestButtons(_QtBase):
         """Кнопки тулбара: trigger() → ctrl.on_button; подсветка checkable."""
 

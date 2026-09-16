@@ -167,6 +167,18 @@ class VideoCanvas(QWidget):
         self._update_size()   # width/height/scale могли измениться (ROI / `,` `.`)
         self.update()
 
+    def paintEvent(self, event) -> None:  # noqa: N802 (имя Qt)
+        """Отрисовать последний кадр (до первого кадра — чёрный фон)."""
+        from PySide6.QtGui import QPainter
+        p = QPainter(self)
+        pm = getattr(self, "_pixmap", None)
+        if pm is not None and not pm.isNull():
+            # pixmap в исходном разрешении; растягиваем на размер виджета (×scale)
+            p.drawPixmap(0, 0, int(self.width()), int(self.height()), pm)
+        else:
+            p.fillRect(self.rect(), Qt.GlobalColor.black)
+        p.end()
+
     def _to_source_coords(self, pos: QPoint) -> tuple[int, int]:
         """Координаты события на canvas → координаты исходного кадра."""
         return unscale_mouse(pos.x(), pos.y(), self._ctrl.scale,
