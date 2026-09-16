@@ -75,10 +75,15 @@ class AutoUiScaleIntegrationTest(unittest.TestCase):
     """Шаг «выбор scale» подключён в calibrate и count --gui (без окна)."""
 
     def test_calibrate_uses_auto_ui_scale(self):
-        from visio_people_counter import calibrate
-        src = inspect.getsource(calibrate.run_calibration)
-        self.assertIn("auto_ui_scale(w, h, scale_base)", src)
+        # задача 15: логика выбора масштаба — в контроллере (open/_apply_roi_change),
+        # run_calibration остался тонким cv2-драйвером
+        from visio_people_counter.calib_controller import CalibrationController
+        src = inspect.getsource(CalibrationController)
+        self.assertIn("auto_ui_scale(self.w, self.h, scale_base)", src)
         self.assertIn("малое изображение", src)   # уведомление в окне + print
+        from visio_people_counter import calibrate
+        drv = inspect.getsource(calibrate.run_calibration)
+        self.assertIn("CalibrationController", drv)   # драйвер создаёт контроллер
 
     def test_gui_player_run_uses_auto_ui_scale(self):
         src = inspect.getsource(GuiPlayer.run)

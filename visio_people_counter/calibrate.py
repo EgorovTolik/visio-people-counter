@@ -56,7 +56,6 @@ from __future__ import annotations
 
 import math
 import sys
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -71,11 +70,9 @@ from .config import (
     ZoneCounterConfig,
     describe_roi,
 )
-from .gui import GuiPlayer, auto_ui_scale
+from .gui import GuiPlayer   # окно/доступность GUI — только в драйвере run_calibration
 from .text_overlay import put_text, text_width
-from .motion_detector import MotionDetector
-from .pipeline import Pipeline
-from .video_source import FfmpegPipeSource, VideoSourceError
+from .video_source import VideoSourceError
 
 #: сколько первых кадров видео загрузить в кэш по умолчанию (для HLS — первые кадры);
 #: переопределяется параметром cache_frames / CLI --cache-frames.
@@ -1152,17 +1149,6 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
               file=sys.stderr)
         return 1
 
-    # источник + первые кадры (для HLS — первые кадры потока)
-    pipe = None
-    try:
-        pipe = Pipeline(cfg).build()
-    except (VideoSourceError, ConfigError) as e:
-        if pipe is not None:
-            pipe.close()  # build мог упасть после source.open() — не утекает ресурс
-        print(f"calibrate: ошибка источника: {e}", file=sys.stderr)
-        return 1
-    w, h = pipe.source.width, pipe.source.height
-
     # Куда сохранять при [a]: явный save_to (--config) → строго туда; иначе рядом
     # с файлом видео как <имя_видео>.config.yaml; для HLS/URL фолбэк на --config.
     if save_to is not None:
@@ -1174,480 +1160,63 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
                   f"(«рядом с видео» для потока не определено)")
     print(f"calibrate: результат [a] → {save_target}")
 
-    detector = MotionDetector(cfg)   # для 'm' — live-маска движения
-    frames: list[np.ndarray] = []
-    masks: list[Optional[np.ndarray]] = []
-    frame_indices: list[int] = []   # ГЛОБАЛЬНЫЕ номера кадров (0-based) — для статуса «кадр N»
+    # Вся логика «кадр за кадром» (источник, кэш кадров, детектор, оверлеи, кнопки,
+    # seek, ROI-переоткрытие, save, уведомления) — в контроллере; cv2-окно здесь —
+    # только тонкий драйвер (задача 15). Поведение без изменений: те же клавиши,
+    # кнопки, сообщения, save, seek и авто-масштаб.
+    from .calib_controller import CalibrationController   # ленивый импорт: нет цикла на уровне модулей
 
-    def _load_cache() -> int:
-        """Загрузить до cache_frames кадров от ТЕКУЩЕЙ позиции источника с масками;
-        ЗАМЕНЯЕТ списки frames/masks/frame_indices. Возвращает число загруженных кадров."""
-        frames.clear()
-        masks.clear()
-        frame_indices.clear()
-        while len(frames) < cache_frames:
-            fr = pipe.source.read()
-            if fr is None:
-                break
-            detector.detect(fr.image)
-            frames.append(fr.image.copy())
-            masks.append(getattr(detector, "last_mask", None))
-            frame_indices.append(fr.index)
-        return len(frames)
+    try:
+        ctrl = CalibrationController(
+            cfg, counter_id=counter_id, cache_frames=cache_frames,
+            initial_scale=initial_scale, window_name=window_name,
+            save_to=save_target)
+        ctrl.open()   # Pipeline + кэш первых кадров + seek к processing.frame_start
+    except (VideoSourceError, ConfigError):
+        # ошибка источника / ни одного кадра: сообщение уже напечатано в stderr;
+        # источник закрываем строго до возврата (как раньше — в finally)
+        ctrl.close()
+        return 1
 
-    # seek (клавиша [t]/кнопка «время») возможен только для файла: у ffmpeg-пайпа
-    # (HLS/URL) случайного доступа нет — базовый VideoSource.seek() возвращает False.
-    seek_supported = not isinstance(pipe.source, FfmpegPipeSource)
-    time_buf = TimeInputBuffer()
-    time_input_active = False   # режим ввода времени (переключается в цикле окна)
-
-    state = CalibrationState(counter_id=counter_id)
-    mask_on = False
-    show_all = False   # режим «все»: показать все счётчики из конфига с размерами (только визуал)
-    idx = 0
-    saved_once = False
-    pending_msgs: list[tuple[str, float]] = []  # (текст, expires_at — time.monotonic)
-    buttons: list[Button] = []   # раскладка панели (обновляется каждый кадр отрисовкой)
-    scale_base = max(0.05, initial_scale)   # --scale: старт масштаба ОТОБРАЖЕНИЯ (клавиши `,`/`.`); обработка — в исходном
-
-    def _notify(msg: str) -> None:
-        """Сообщение на экране: живёт MESSAGE_TTL_SECONDS секунд."""
-        pending_msgs.append((msg, time.monotonic() + MESSAGE_TTL_SECONDS))
-
-    # задача 14: маленький кадр (маленький ROI) → авто-увеличение окна для доступного UI;
-    # user --scale — минимум; клавиши `,`/`.` продолжают работать поверх авто-значения
-    scale = auto_ui_scale(w, h, scale_base)
-    if scale > scale_base:
-        msg = f"малое изображение {w}×{h} — окно увеличено до {scale:g}x для доступного UI"
-        print(f"calibrate: {msg}")
-        _notify(msg)
-
-    def _begin_time_input() -> None:
-        """[t]/кнопка «время» — включить режим ввода времени для seek.
-
-        Для HLS/URL (нет случайного доступа) режим НЕ включается — только уведомление;
-        повторное нажатие при открытом режиме ничего не делает (не дублирует).
-        Собранные линии/зоны/счётчик при этом не трогаются.
-        """
-        nonlocal time_input_active
-        if time_input_active:
-            return
-        if not seek_supported:
-            _notify("seek недоступен для HLS/URL — только файл видео")
-            return
-        time_buf.reset()
-        time_input_active = True
-        _notify(f"Время (сек): наберите цифры 0-9 | Enter=OK, ESC/q=отмена")
-
-    def _seek_to(t_s: float) -> bool:
-        """source.seek(t_s) + замена кэша кадрами после метки (общая логика seek).
-
-        Используется и клавишей [t] (:func:`_apply_time_seek`), и стартовым
-        переходом к ``processing.frame_start`` (задача 12). State (линии/зоны/
-        sizes/текущий счётчик) НЕ сбрасывается — только кэш кадров. Если после
-        метки нет ни одного кадра — возврат в начало, чтобы окно не осталось
-        без кадров.
-
-        :returns: True, если после метки кадры есть (idx=0); False — seek не
-            удался или за пределами видео (кэш уже возвращён в начало).
-        """
-        nonlocal idx
-        if not pipe.source.seek(t_s):
-            return False
-        n_loaded = _load_cache()   # читает от новой метки, ЗАМЕНЯЕТ frames/masks
-        idx = 0
-        if n_loaded == 0:
-            pipe.source.seek(0.0)
-            _load_cache()
-            return False
-        return True
-
-    def _apply_time_seek() -> None:
-        """Enter в режиме ввода: source.seek(N) и замена кэша кадрами после метки.
-
-        State (линии/зоны/sizes/текущий счётчик) НЕ сбрасывается — только кэш кадров.
-        Если после метки нет ни одного кадра — возврат в начало, чтобы окно не осталось
-        без кадров.
-        """
-        nonlocal time_input_active
-        v = time_buf.value()
-        if v is None:
-            _notify("время не задано — наберите цифры 0-9")
-            return
-        # время больше длительности файла → конец минус cache_frames (иначе cv2 уйдёт в начало)
-        t_seek, clamped = clamp_seek_time(float(v), getattr(pipe.source, "duration", 0.0),
-                                          cache_frames, pipe.source.fps)
-        if clamped:
-            _notify(f"время {v} с больше длительности файла — seek к {t_seek:.1f} с "
-                    f"(конец − {cache_frames} кадр(ов))")
-        time_input_active = False
-        if not _seek_to(t_seek):
-            if seek_supported:
-                _notify(f"seek к {v} c: после метки нет кадров — вернулся в начало")
-            else:
-                _notify("seek недоступен для HLS/URL — только файл видео")
-        else:
-            _notify(f"seek к {v} c: загружено {len(frames)} кадр(ов)")
-
-    def _switch_counter(direction: int) -> None:
-        """[<]/[>]/[ ] — переключение счётчика с загрузкой его геометрии."""
-        try:
-            new_id = cycle_counter_id([c.id for c in cfg.counters],
-                                      state.counter_id, direction)
-            counter = next(c for c in cfg.counters if c.id == new_id)
-            load_counter_into_state(state, counter)
-            _notify(f"счётчик: {new_id} (геометрия загружена для правки)")
-        except ValueError as e:
-            _notify(str(e))
-
-    def _new_counter(kind: str) -> None:
-        """+линия/+зона — новый счётчик (в cfg попадёт при [a])."""
-        new_id = make_new_counter_id({c.id for c in cfg.counters}, kind)
-        state.counter_id = new_id
-        state.set_mode("line" if kind == "line" else "zone")   # пустые точки, нужный режим
-        _notify(f"новый счётчик {new_id} — нарисуйте {'линию' if kind == 'line' else 'зону'}, "
-                f"[a] сохранит в конфиг")
-
-    def _do_delete() -> None:
-        """удалить/x — удалить текущий счётчик (логика в delete_current_counter)."""
-        msg = delete_current_counter(cfg, state)
-        _notify(msg)
-        print(f"calibrate: {msg}")
-
-    def _do_undo_size_point() -> None:
-        """[b] — отменить последнюю size-точку (кнопки в панели нет).
-
-        Работает осмысленно только в режиме «размер»: из других режимов
-        точки НЕ удаляются, а выдаётся подсказка включить режим размер.
-        """
-        if state.mode != "size":
-            _notify("−точка: включите режим размер (клавиша s / кнопка «размер»)")
-            return
-        pt = undo_last_size_point(state)
-        if pt is None:
-            _notify("размер: точек нет")
-        else:
-            _notify(f"размер: последняя точка отменена (x={pt[0]:.3f}, "
-                    f"y={pt[1]:.3f}, h={int(round(pt[2] * 100))}%)")
-
-    def _do_save() -> None:
-        nonlocal saved_once
-        try:
-            changed = list(apply_calibration(cfg, state))
-            # ROI пишется в конфиг вместе с остальными блоками (как сейчас);
-            # если других изменений нет — roi единственное изменение
-            if not changed and cfg.processing.roi is not None:
-                changed.append(f"processing.roi: {describe_roi(cfg.processing.roi)}")
-            if not changed:
-                _notify("ничего не менялось — нет собранных линий/зон/size-точек")
-            else:
-                Config.save(cfg, save_target)
-                saved_once = True
-                print(f"calibrate: сохранено в {save_target}:")
-                for line in changed:
-                    print(f"  - {line}")
-                print(f"calibrate: дальше — "
-                      f".venv/bin/python -m visio_people_counter count --config {save_target}")
-        except (ConfigError, OSError) as e:
-            _notify(f"ошибка записи: {e}")
-
-    def _set_draw_mode(kind: str) -> None:
-        """Переключить режим рисования; если текущий счётчик другого типа — новый id."""
-        new_id = ensure_counter_kind(cfg, state, kind)
-        state.set_mode(kind)
-        if new_id is not None:
-            what = {"line": "линию", "zone": "зону"}[kind]
-            _notify(f"текущий счётчик — другого типа: создан новый {new_id} для {what}")
-
-    def _begin_roi_mode() -> None:
-        """[r]/кнопка «roi» — режим «ROI»: два клика по углам, Enter — принять.
-
-        Повторный запуск при существующем ROI — правка: текущий прямоугольник
-        показывается в окне как стартовые углы (рисуется поверх, клик заново).
-        """
-        state.set_mode("roi")
-        old = cfg.processing.roi
-        if old is not None:
-            x, y, w_, h_ = old
-            state.roi_points = [(x, y), (round(x + w_, 4), round(y + h_, 4))]
-            _notify(f"ROI: правка существующего ({describe_roi(old)}) — кликните 2 угла заново "
-                    f"или Enter — оставить как есть")
-        else:
-            _notify("ROI: кликните ДВА угла области обработки; Enter — принять, ESC — отмена")
-
-    def _apply_roi_change(new_roi: list[float]) -> None:
-        """Enter в режиме «ROI»: принять [x,y,w,h] (норм. полный кадр).
-
-        При отличии от текущего ROI: источник переоткрывается с кропом
-        (новый Pipeline), текущая позиция по времени сохраняется, если возможно;
-        окно сразу показывает ROI-вид (рамка + подпись в статусе). Вызывается
-        после проверки минимального размера прямоугольника.
-        """
-        nonlocal pipe, detector, w, h, idx, scale
-        old = cfg.processing.roi
-        if list(new_roi) == (list(old) if old is not None else None):
-            state.mode = None
-            state.roi_points = []
-            _notify(f"ROI без изменений: {describe_roi(new_roi)}")
-            return
-        # текущая позиция по времени (best effort; для HLS/без fps — с начала)
-        t_cur: Optional[float] = None
-        if idx < len(frame_indices) and pipe.source.fps > 0:
-            t_cur = float(frame_indices[idx]) / float(pipe.source.fps)
-        cfg.processing.roi = list(new_roi)
-        try:
-            new_pipe = Pipeline(cfg).build()
-        except (VideoSourceError, ConfigError) as e:
-            cfg.processing.roi = old   # откат: окно продолжает работать со старым источником
-            state.mode = None
-            state.roi_points = []
-            _notify(f"ROI не применён (источник не открылся): {e}")
-            return
-        pipe.close()
-        pipe = new_pipe
-        w, h = pipe.source.width, pipe.source.height
-        detector = MotionDetector(cfg)   # модель фона под новый размер кадра
-        # авто-масштаб при новом (возможно, крошечном) размере: UI должен остаться доступным
-        new_scale = auto_ui_scale(w, h, scale)
-        if new_scale != scale:
-            scale = new_scale
-            print(f"calibrate: малое изображение {w}×{h} — масштаб окна → {scale:g}x")
-            _notify(f"малое изображение {w}×{h} — окно увеличено до {scale:g}x для доступного UI")
-        if t_cur is not None and seek_supported:
-            _seek_to(t_cur)              # сохранение позиции; при неудаче — возврат в начало
-        else:
-            _load_cache()
-            idx = 0
-            if not frames:
-                _notify("ROI: после переоткрытия источника кадры не загрузились — "
-                        "проверьте поток")
-        state.mode = None
-        state.roi_points = []
-        print(f"calibrate: ROI изменён: {describe_roi(old) if old is not None else 'нет'} → "
-              f"{describe_roi(new_roi)} (источник переоткрыт с кропом, кадры {w}x{h})")
-        _notify("ROI изменён — проверьте линии/зоны (режим «все»): их координаты "
-                "отсчитываются от ROI")
-
-    def _do_button(name: str) -> None:
-        nonlocal mask_on, show_all
-        if name == "line":
-            _set_draw_mode("line")
-        elif name == "zone":
-            _set_draw_mode("zone")
-        elif name == "size":
-            state.set_mode("size")
-        elif name == "roi":
-            _begin_roi_mode()
-        elif name == "mask":
-            mask_on = not mask_on
-        elif name == "show_all":
-            show_all = not show_all
-        elif name == "prev":
-            _switch_counter(-1)
-        elif name == "next":
-            _switch_counter(1)
-        elif name == "new_line":
-            _new_counter("line")
-        elif name == "new_zone":
-            _new_counter("zone")
-        elif name == "delete":
-            _do_delete()
-        elif name == "undo_size":
-            _do_undo_size_point()
-        elif name == "time":
-            _begin_time_input()
-        elif name == "save":
-            _do_save()
-
-    mouse_xy = [-1, -1]   # позиция курсора (cv2.getMousePos в cv2 5.x отсутствует)
+    cv2.namedWindow(ctrl.window_name)
 
     def on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_MOUSEMOVE:
-            mouse_xy[0], mouse_xy[1] = x, y
-            return
-        if event != cv2.EVENT_LBUTTONDOWN:
+        if event not in (cv2.EVENT_MOUSEMOVE, cv2.EVENT_LBUTTONDOWN):
             return
         # координаты мыши — в системе МАСШТАБИРОВАННОЙ картинки: переводим обратно
         # в координаты исходного кадра ДО hit-test кнопок и обработчиков клика
-        x, y = unscale_mouse(x, y, scale, w, h)
-        # сначала — hit-test панели кнопок (только верхняя область кадра);
-        # клик по кнопке НЕ передаётся в state.handle_click
-        name = hit_button(buttons, x, y)
-        if name is not None:
-            _do_button(name)
-            return
-        try:
-            for msg in handle_size_click(state, x, y, w, h):
-                _notify(msg)
-        except ValueError as e:
-            _notify(str(e))
+        # (hit-test панели и логика режимов — внутри ctrl.on_click)
+        ux, uy = unscale_mouse(x, y, ctrl.scale, ctrl.width, ctrl.height)
+        if event == cv2.EVENT_MOUSEMOVE:
+            ctrl.on_mouse_move(ux, uy)   # live-превью pending «мерки роста»
+        else:
+            ctrl.on_click(ux, uy)
 
+    cv2.setMouseCallback(ctrl.window_name, on_mouse)
     try:
-        if not _load_cache():   # начальная загрузка первых cache_frames кадров
-            print("calibrate: ОШИБКА: не удалось прочитать ни одного кадра", file=sys.stderr)
-            return 1
-        # processing.frame_start — сразу открыть этот кадр (задача 12): seek как [t],
-        # только для файла; если fps/seek недоступны или кадр за пределами видео —
-        # уведомление и старт с начала.
-        fs_frame = cfg.processing.frame_start
-        if fs_frame is not None:
-            if not seek_supported:
-                print("calibrate: processing.frame_start задан, но для HLS/URL "
-                      "случайного доступа нет — переход пропущен")
+        while True:
+            img = ctrl.step()   # кадр ИСХОДНОГО разрешения со ВСЕМИ оверлеями; None — выход/нет кадров
+            if img is None or ctrl.quit_requested:
+                break
+            # масштаб ОТОБРАЖЕНИЯ: overlay нарисован в исходном разрешении, только
+            # перед imshow уменьшаем/увеличиваем кадр (обработка не затрагивается)
+            if ctrl.scale == 1.0:
+                disp = img
             else:
-                t0 = frame_start_seek_time(fs_frame, pipe.source.fps)
-                if t0 is None:
-                    print("calibrate: fps источника <= 0 — переход к кадру "
-                          f"{fs_frame} (processing.frame_start) пропущен")
-                else:
-                    t0, _clamped = clamp_seek_time(
-                        t0, getattr(pipe.source, "duration", 0.0),
-                        cache_frames, pipe.source.fps)
-                    if _seek_to(t0):
-                        _notify(f"переход к кадру {fs_frame} (processing.frame_start)")
-                    else:
-                        _notify(f"кадр {fs_frame} за пределами видео — старт с начала")
-        # ROI задан во входном конфиге: окно сразу на ROI-виде (источник уже кропит)
-        if cfg.processing.roi is not None:
-            print(f"calibrate: ROI применён из конфига: {describe_roi(cfg.processing.roi)} "
-                  f"(окно показывает ROI-вид; правка — клавиша r / кнопка «roi»)")
-            _notify(f"ROI применён из конфига: {describe_roi(cfg.processing.roi)}")
-        print(f"calibrate: загрузил {len(frames)} кадр(ов) {w}x{h}, "
-              f"counter-id={counter_id!r}; [n/p] — листать, "
-              f"{'[t] — время (seek), ' if seek_supported else ''}[a] — сохранить в {config_path}")
-
-        cv2.namedWindow(window_name)
-        cv2.setMouseCallback(window_name, on_mouse)
-        try:
-            while True:
-                base = frames[idx]
-                img = _draw_calibration(base, state, mask_on, masks[idx], w, h,
-                                        mouse_pos=unscale_mouse(mouse_xy[0], mouse_xy[1],
-                                                                scale, w, h)
-                                        if mouse_xy[0] >= 0 else None,
-                                        active_roi=cfg.processing.roi)
-                # подпись ROI в статусной строке (текущее значение из конфига)
-                roi_label = None
-                if cfg.processing.roi is not None:
-                    roi_txt = describe_roi(cfg.processing.roi)
-                    roi_label = f"ROI: {roi_txt} (правка — r)" if state.mode == "roi" \
-                        else f"ROI: {roi_txt}"
-                buttons = draw_top_panel(img, state.counter_id, cfg.counters,
-                                         state.mode, mask_on, show_all=show_all,
-                                         scale=scale,
-                                         frame_index=(frame_indices[idx]
-                                                      if idx < len(frame_indices) else None),
-                                         roi_label=roi_label)
-                # красные сообщения — под строкой кнопок (панель заканчивается ~y=66);
-                # живут MESSAGE_TTL_SECONDS секунд
-                pending_msgs[:] = filter_expired_messages(pending_msgs, time.monotonic())
-                for i, (msg, _exp) in enumerate(pending_msgs):
-                    draw_notification(img, msg[:90], x=10, y=72 + 20 * i, size_px=14)
-                if time_input_active:
-                    # буфер ввода времени дублируется на экране каждый кадр
-                    buf_str = "".join(str(d) for d in time_buf.digits) or "_"
-                    put_text(img, f"Время (сек): {buf_str} | Enter=OK, ESC/q=отмена",
-                             (10, 92), size_px=16, color=(0, 255, 255))
-                if show_all:
-                    # режим «все» — поверх всего: все линии/зоны из конфига с размерами;
-                    # текущий счётчик совпадает по цвету с редактируемым и не дублируется криво
-                    draw_all_counters(
-                        img, cfg.counters, w, h, highlight_id=state.counter_id,
-                        size_points=(state.size_points
-                                     or [list(p) for p in cfg.size_profile.control_points]))
-                # масштаб ОТОБРАЖЕНИЯ: рисуем overlay в исходном разрешении и только
-                # перед imshow уменьшаем/увеличиваем кадр (обработка не затрагивается)
-                if scale == 1.0:
-                    disp = img
-                else:
-                    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-                    disp = cv2.resize(
-                        img, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
-                        interpolation=interp)
-                cv2.imshow(window_name, disp)
-                key = cv2.waitKey(1) & 0xFF
-
-                if time_input_active:
-                    # режим ввода времени имеет приоритет: цифры уходят только в буфер
-                    if key in (ord("q"), ord("Q"), 27):
-                        time_input_active = False
-                        time_buf.reset()
-                        _notify("ввод времени отменён")
-                    elif key == 13:   # Enter — применить seek
-                        _apply_time_seek()
-                    elif 48 <= key <= 57:    # цифры 0-9 → в буфер
-                        time_buf.feed_digit(key - 48)
-                    elif key in (ord("-"), 8, 127):   # '-' или Backspace (X11=127, Win=8)
-                        time_buf.backspace()
-                elif key in (ord("q"), ord("Q"), 27):
-                    if state.mode == "roi":
-                        # ESC в режиме «ROI» — отмена рисования (не выход из окна)
-                        state.cancel_roi()
-                        _notify("ROI: отменено (источник не переоткрывался)")
-                    else:
-                        break
-                elif key == ord("l"):
-                    _set_draw_mode("line")
-                elif key == ord("z"):
-                    _set_draw_mode("zone")
-                elif key == ord("s"):
-                    state.set_mode("size")
-                elif key == ord("r"):
-                    # повторный r — заново (или правка существующего ROI)
-                    _begin_roi_mode()
-                elif key == 13:  # Enter — замкнуть зону / завершить size-точки / принять ROI
-                    if state.mode == "zone":
-                        try:
-                            state.finish_zone()
-                            _notify(f"зона закрыта: {len(state.zone_points)} точек")
-                        except ValueError as e:
-                            _notify(str(e))
-                    elif state.mode == "size":
-                        state.finish_size()
-                    elif state.mode == "roi":
-                        try:
-                            new_roi = state.finish_roi()
-                        except ValueError as e:
-                            _notify(str(e))
-                        else:
-                            if min(new_roi[2], new_roi[3]) < MIN_ROI_FRACTION:
-                                _notify("ROI слишком маленький (сторона меньше 1% кадра) — "
-                                        "кликните углы заново")
-                            else:
-                                _apply_roi_change(new_roi)
-                elif key == ord("m"):
-                    mask_on = not mask_on
-                elif key == ord("v"):   # «все» — toggle показа всех счётчиков (только визуал)
-                    show_all = not show_all
-                elif key == ord("n"):
-                    idx = (idx + 1) % len(frames)
-                elif key == ord("p"):
-                    idx = (idx - 1) % len(frames)
-                # цифры 1-9 в режиме «размер» больше не используются
-                # (рост задаётся двумя кликами «меркой роста»)
-                elif key == ord("x"):
-                    _do_delete()
-                elif key == ord("b"):   # отменить последнюю size-точку (только в режиме «размер»)
-                    _do_undo_size_point()
-                elif key == ord("["):   # стрелки у waitKey ненадёжны — берём [ ]
-                    _switch_counter(-1)
-                elif key == "]":
-                    _switch_counter(1)
-                elif key == ord("t"):
-                    _begin_time_input()
-                elif key == ord("a"):
-                    _do_save()
-                elif key == ord(","):   # `,` — масштаб отображения: уменьшить (циклически)
-                    scale = next_scale(scale, -1)
-                elif key == ord("."):   # `.` — масштаб отображения: увеличить (циклически)
-                    scale = next_scale(scale, 1)
-        finally:
-            cv2.destroyAllWindows()
+                interp = cv2.INTER_AREA if ctrl.scale < 1.0 else cv2.INTER_LINEAR
+                disp = cv2.resize(
+                    img, (max(1, int(round(ctrl.width * ctrl.scale))),
+                          max(1, int(round(ctrl.height * ctrl.scale)))),
+                    interpolation=interp)
+            cv2.imshow(ctrl.window_name, disp)
+            key = cv2.waitKey(1) & 0xFF
+            ctrl.on_key(key)   # распределение клавиш — в контроллере (как раньше)
     finally:
         # источник НЕ закрывается во время окна — он нужен для seek ([t]);
         # close строго после destroyAllWindows
-        pipe.close()
+        cv2.destroyAllWindows()
+        ctrl.close()
 
-    if not saved_once:
+    if not ctrl.saved_once:
         print("calibrate: выход БЕЗ сохранения ([a] не нажимался или изменений не было)")
     return 0
