@@ -72,8 +72,22 @@ def _speed_value(s: str) -> float:
     return v
 
 
+def choose_gui_backend(requested, available: bool):
+    """Выбор бэкенда GUI-окна (чистая функция — тестируется без импорта Qt).
+
+    :param requested: значение CLI ``--backend``: None / "qt" / "cv2".
+    :param available: установлен ли PySide6 в этой среде.
+    :returns: "qt" | "cv2"; None — ошибка (явный qt без PySide6 → CLI с rc=1).
+    """
+    if requested is None:
+        return "qt" if available else "cv2"
+    if requested == "qt":
+        return "qt" if available else None
+    return "cv2"   # явный cv2 — без PySide6 тоже работает
+
+
 def cmd_count(args: argparse.Namespace) -> int:
-    """Подсчёт: headless по умолчанию; --gui [--speed] — GUI-режим (задача 16)."""
+    """Подсчёт: headless по умолчанию; --gui [--speed] [--backend qt|cv2] — GUI (задачи 16/17)."""
     try:
         cfg = Config.load(args.config)
     except ConfigError as e:
@@ -93,12 +107,37 @@ def cmd_count(args: argparse.Namespace) -> int:
     try:
         pipe = Pipeline(cfg, bench=args.bench)
         if args.gui:
+            # проверка доступности GUI — для обоих бэкендов (нет DISPLAY/WAYLAND)
             from .gui import GuiPlayer
             if not GuiPlayer.available():
                 print(f"count --gui: ОШИБКА: {GuiPlayer.unavailable_reason()}", file=sys.stderr)
                 return 1
+            # бэкенд окна (задача 17): явный --backend; иначе qt при установленном
+            # PySide6, иначе cv2-окно с предупреждением в stdout (логика как у calibrate)
+            pyside = _pyside_available()
+            backend = choose_gui_backend(args.backend, pyside)
+            if backend is None:
+                print("count: ОШИБКА: --backend qt требует PySide6 (не установлен). "
+                      "Установите: .venv/bin/pip install PySide6 — или запускайте с "
+                      "--backend cv2", file=sys.stderr)
+                return 1
+            if backend == "cv2" and args.backend is None and not pyside:
+                print("PySide6 не установлен — использую cv2-окно; для Qt: "
+                      ".venv/bin/pip install PySide6")
+            if backend == "qt":
+                try:
+                    from .gui_qt import run_count_qt   # лениво: Qt не тянется без запроса
+                except ImportError as e:
+                    print(f"count: ОШИБКА: PySide6 не импортируется ({e}); "
+                          f"установите заново (.venv/bin/pip install --force-reinstall PySide6) "
+                          f"или используйте --backend cv2", file=sys.stderr)
+                    return 1
+                return run_count_qt(pipe, speed=args.speed, initial_scale=args.scale)
             player = GuiPlayer(pipe, speed=args.speed, initial_scale=args.scale)
             return player.run()
+        if args.backend is not None:
+            print("count: --backend работает только вместе с --gui (игнорирую)",
+                  file=sys.stderr)
         return pipe.run()
     except (VideoSourceError, ConfigError) as e:
         print(f"count: ошибка: {e}", file=sys.stderr)
@@ -200,11 +239,14 @@ _COUNT_EPILOG = """примеры значений:
   --video    путь или URL: videos/1.mp4, https://…/stream.m3u8 (переопределяет video.path)
   --scale    число 0.05..8 (только --gui): --scale 0.5 | --scale 2 ; пресеты в окне — `,` / `.`
   --speed    число 0.25..8 (только --gui): --speed 0.5 (медленнее), --speed 4 (быстрее)
+  --backend  окно подсчёта: qt | cv2; по умолчанию qt при установленном PySide6,
+             иначе cv2 с предупреждением (установка Qt: .venv/bin/pip install PySide6)
 
 примеры:
   visio_people_counter count --config videos/demo.config.yaml
   visio_people_counter count --config cfg.yaml --video /tmp/x.mp4 --bench
-  visio_people_counter count --config cfg.yaml --gui --speed 1.5 --scale 0.75"""
+  visio_people_counter count --config cfg.yaml --gui --speed 1.5 --scale 0.75
+  visio_people_counter count --config c.yaml --gui --backend qt --speed 2"""
 
 _CAL_EPILOG = """примеры значений:
   --video          путь к файлу или URL (для seek по времени нужен файл)
@@ -252,6 +294,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="начальный масштаб отображения окна (--gui), число 0.05..8; напр. --scale 0.75")
     p_count.add_argument("--speed", type=_speed_value, default=1.0, metavar="FLOAT",
                          help="скорость воспроизведения в GUI, число 0.25..8 (по умолчанию 1.0)")
+    p_count.add_argument("--backend", choices=["qt", "cv2"], default=None,
+                         metavar="{qt,cv2}",
+                         help="окно подсчёта (--gui): Qt (PySide6) или cv2; по умолчанию qt, "
+                              "если установлен PySide6, иначе cv2 с предупреждением")
     p_count.set_defaults(func=cmd_count)
 
     p_cal = sub.add_parser(

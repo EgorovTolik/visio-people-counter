@@ -220,6 +220,11 @@ class GuiPlayer:
     Клавиши: **пробел** — пауза/далее; **q**/**ESC** — выход; **+**/**=**,
     **-**/**−** — скорость ×1.5 / ÷1.5 (в пределах 0.25..8); **`,`**/**`.`** —
     масштаб ОТОБРАЖЕНИЯ пресеты 0.5/1/1.5/2 (только экран, обработка не меняется).
+
+    Публичный API для внешнего драйвера окна (Qt, задача 17): :meth:`handle_key`
+    (обёртка над ``_handle_key``), :meth:`tick` (один шаг кадра без imshow;
+    cv2-цикл :meth:`run` переписан через него) и :meth:`finalize` (финальная
+    сводка + markdown-отчёт, идемпотентна).
     """
 
     #: Имя окна — только ASCII: GNOME/GTK использует заголовок для имени файла
@@ -243,6 +248,25 @@ class GuiPlayer:
         self._stop = False
         self._paused = False
         self._last_view: np.ndarray | None = None  # удержание кадра в паузе
+        # задача 17 — API для внешнего драйвера (Qt-окно): состояние последнего шага
+        self.frame_index: int | None = None   # индекс последнего обработанного кадра
+        self.proc_dt: float = 0.0             # время обработки последнего кадра (pacing)
+        self.last_message: str = ""           # последнее событие (для статусбара Qt-окна)
+        self._proc_ema: float = 0.0           # EMA времени обработки (проц-fps в статусе)
+        self._finalized: bool = False         # finalize() идемпотентен
+
+    # ------------------------------------------------------------- публичный API (задача 17)
+    def handle_key(self, key: int) -> None:
+        """Публичная обёртка над :meth:`_handle_key` (коды cv2 ``waitKey & 0xFF``).
+
+        Для внешнего драйвера окна (Qt-кнопки/клавиатура): логика та же —
+        q/ESC — выход, пробел — пауза, +/- — скорость, `,`/`.` — масштаб.
+        """
+        self._handle_key(key)
+
+    def status_text(self, proc_fps: float, frame_index: int | None = None) -> str:
+        """Публичный alias :meth:`_status_text` (строка статуса для статусбара)."""
+        return self._status_text(proc_fps, frame_index=frame_index)
 
     # ------------------------------------------------------------------ headless
     @staticmethod
@@ -328,6 +352,77 @@ class GuiPlayer:
                 txt += f"   {extra}"
         return txt
 
+    # ------------------------------------------------------------- tick/finalize (задача 17)
+    def tick(self) -> Optional[np.ndarray]:
+        """Один шаг «кадра цикла» БЕЗ окна (используется cv2-run и Qt-окном).
+
+        * пауза → вернуть последний сохранённый view (как cv2-run: удержание кадра);
+        * иначе — прочитать кадр из pipeline, ``_process_frame``, overlay,
+          ``_scaled_view``; источник открывается лениво (``build()`` + авто-масштаб);
+        * EOF / stop → ``None``.
+
+        :returns: кадр для отображения (с учётом ``self.scale``) или ``None`` — завершить.
+        """
+        pipe = self.pipeline
+        if pipe.source is None:
+            pipe.build()
+            # задача 14: маленький кадр → авто-увеличение масштаба отображения
+            # (идемпотентно/монотонно — run() применяет тот же вызов перед циклом)
+            self.scale = auto_ui_scale(pipe.source.width, pipe.source.height, self.scale)
+        if self._paused:
+            return self._scaled_view(self._last_view) if self._last_view is not None else None
+        while not self._stop:
+            frame = pipe.source.read()
+            if frame is None:
+                # разрыв потока (не EOF): read() внутри уже отспал backoff
+                if isinstance(pipe.source, FfmpegPipeSource) and not pipe.source.exhausted:
+                    time.sleep(0.1)
+                    continue
+                return None   # EOF файла / источник исчерпан
+            break
+        if self._stop:
+            return None
+
+        t0 = time.monotonic()
+        blobs, objects = self._process_frame(frame)
+        mask = getattr(pipe.detector, "last_mask", None)
+        proc_dt = max(1e-6, time.monotonic() - t0)
+        self.proc_dt = proc_dt
+        self._proc_ema = 0.9 * self._proc_ema + 0.1 * proc_dt if self._proc_ema else proc_dt
+        self.frame_index = frame.index
+
+        view = self.overlay.draw(
+            frame.image, objects=objects, blobs=blobs, mask=mask,
+            counters=pipe.counters,
+            status_text=self.status_text(1.0 / max(1e-6, self._proc_ema),
+                                         frame_index=frame.index))
+        # отладочные кадры с overlay (cfg.debug.save_debug_frames_dir)
+        dbg = self.cfg.debug
+        if dbg.save_debug_frames_dir and \
+                frame.index % max(1, int(dbg.debug_frame_step)) == 0:
+            save_debug_frame(view, dbg.save_debug_frames_dir, frame.index)
+        self._last_view = view
+        # масштаб ОТОБРАЖЕНИЯ — только для вывода (обработка — в исходном разрешении)
+        return self._scaled_view(view)
+
+    def finalize(self, reason: str) -> None:
+        """Финальное завершение: финальная сводка + markdown-отчёт с причиной + close.
+
+        Идемпотентна (флаг ``_finalized``): cv2-run и Qt-окно вызывают её в своём
+        ``finally``, повторные вызовы игнорируются (отчёт записывается один раз).
+        """
+        if self._finalized:
+            return
+        self._finalized = True
+        pipe = self.pipeline
+        # markdown-отчёт — до close(): нужны fps/duration источника.
+        # Сводка — только если конвейер собран (event_log создан в build());
+        # закрытие окна раньше первого кадра (source None) — без сводки.
+        if pipe.event_log is not None:
+            pipe._print_final(reason)
+        pipe._write_report(reason)
+        pipe.close()
+
     # ------------------------------------------------------------------ run
     def _process_frame(self, frame) -> tuple[list[Blob], list[TrackedObject]]:
         """Один кадр через компоненты pipeline (аналог Pipeline.step + blobs/mask)."""
@@ -357,8 +452,10 @@ class GuiPlayer:
         if events:
             pipe.event_log.log_events(events)
             for ev in events:
-                _emit(f"СОБЫТИЕ {ev.counter_id} {ev.direction} track={ev.track_id} "
-                      f"@ ({ev.x_px:.0f},{ev.y_px:.0f}) frame={ev.frame_index}")
+                msg = (f"СОБЫТИЕ {ev.counter_id} {ev.direction} track={ev.track_id} "
+                       f"@ ({ev.x_px:.0f},{ev.y_px:.0f}) frame={ev.frame_index}")
+                _emit(msg)
+                self.last_message = msg   # для статусбара Qt-окна (задача 17)
         return blobs, objects
 
     def run(self) -> int:
@@ -383,57 +480,26 @@ class GuiPlayer:
         _emit(f"GUI-режим: окно {self.window_name!r}, speed={self.speed:g}x "
               f"(+/- ×/÷1.5, ,/. масштаб 0.5-2 только экран, space — пауза, q/ESC — выход)")
 
-        last_proc_dt = 0.0
         try:
+            # задача 17: цикл переписан через публичный tick() (тот же pacing) —
+            # та же логика, что у Qt-окна; поведение cv2-варианта сохранено.
             while not self._stop:
-                if self._paused:
-                    # пауза: не читаем новые кадры, держим последний на экране
-                    if self._last_view is not None:
-                        cv2.imshow(self.window_name, self._scaled_view(self._last_view))
-                    key = cv2.waitKey(1) & 0xFF
-                    self._handle_key(key)
-                    continue
-
-                frame = src.read()
-                if frame is None:
-                    # разрыв потока (не EOF): read() внутри уже отспал backoff
-                    if isinstance(src, FfmpegPipeSource) and not src.exhausted:
-                        time.sleep(0.1)
-                        continue
-                    break  # EOF файла / источник исчерпан
-
-                t0 = time.monotonic()
-                blobs, objects = self._process_frame(frame)
-                mask = getattr(pipe.detector, "last_mask", None)
-                proc_dt = max(1e-6, time.monotonic() - t0)
-                last_proc_dt = 0.9 * last_proc_dt + 0.1 * proc_dt if last_proc_dt else proc_dt
-
-                view = self.overlay.draw(
-                    frame.image, objects=objects, blobs=blobs, mask=mask,
-                    counters=pipe.counters,
-                    status_text=self._status_text(
-                        1.0 / max(1e-6, last_proc_dt), frame_index=frame.index))
-                # отладочные кадры с overlay (cfg.debug.save_debug_frames_dir)
-                dbg = self.cfg.debug
-                if dbg.save_debug_frames_dir and \
-                        frame.index % max(1, int(dbg.debug_frame_step)) == 0:
-                    save_debug_frame(view, dbg.save_debug_frames_dir, frame.index)
-                self._last_view = view
-                # масштаб ОТОБРАЖЕНИЯ — только перед imshow (debug-кадры и обработка
-                # остаются в исходном разрешении)
-                cv2.imshow(self.window_name, self._scaled_view(view))
+                view = self.tick()
+                if view is None:
+                    break   # EOF / источник исчерпан / stop
+                cv2.imshow(self.window_name, view)
                 key = cv2.waitKey(1) & 0xFF
                 self._handle_key(key)
 
-                # темп: (1/fps) / speed минус время обработки кадра
-                if fps > 0:
-                    target = (1.0 / fps) / self.speed - proc_dt
+                # темп: (1/fps) / speed минус время обработки кадра (в паузе — без сна,
+                # как раньше: waitKey(1) даёт реалтайм-задержку)
+                if not self._paused and fps > 0:
+                    target = (1.0 / fps) / self.speed - self.proc_dt
                     if target > 0:
                         time.sleep(target)
         finally:
             cv2.destroyAllWindows()
-            # markdown-отчёт (задача 10) — как в headless: до close(), нужны fps/duration
-            pipe._write_report("окно закрыто (GUI)")
-            pipe.close()
+            # финальная сводка + markdown-отчёт (до close(): нужны fps/duration)
+            self.finalize("окно закрыто (GUI)")
         _emit("GUI-режим: окно закрыто")
         return 0

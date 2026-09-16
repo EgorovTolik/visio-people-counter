@@ -129,6 +129,15 @@ blob'ы, микс с маской движения, линии/зоны счёт
 .venv/bin/python -m visio_people_counter count --config config.yaml --gui --speed 0.5
 ```
 
+**Бэкенд окна (`--backend qt|cv2`, задача 17):** как у calibrate — тот же выбор:
+- `qt` (по умолчанию, если установлен PySide6) — Qt-окно: QToolBar над кадром
+  («Пауза»/«+скорость»/«−скорость»/«масштаб ↓»/«масштаб ↑»/«Выход»), статусбар внизу;
+- `cv2` — классическое окно OpenCV; фолбэк без PySide6 (CLI печатает предупреждение).
+
+```bash
+.venv/bin/python -m visio_people_counter count --config config.yaml --gui --backend qt --speed 2
+```
+
 **Клавиши GUI:**
 
 | Клавиша | Действие |

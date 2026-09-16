@@ -12,7 +12,13 @@ ROI, save) не дублируется — Qt-окно только рисует
   («счётчик: … | кадр N | scale=…x | <последнее сообщение>»), QTimer-цикл с
   интервалом ``1000/fps_источника`` (fps<=0 → 33 мс); тик вынесен в :meth:`tick`
   (вызывается таймером И вручную в тестах);
-* :func:`run_calibration_qt` — зеркальный по смыслу ``run_calibration``.
+* :class:`CountQtWindow` — окно подсчёта поверх :class:`~visio_people_counter.gui.GuiPlayer`
+  (задача 17): QToolBar «Пауза/+скорость/−скорость/масштаб ↓/масштаб ↑/Выход»
+  вызывает ``player.handle_key(...)`` с кодами cv2-клавиш; статусбар —
+  ``player.status_text(...)`` + последнее сообщение; QTimer с интервалом
+  ``1000/(fps*speed)`` (fps<=0 → 33 мс), тик — :meth:`CountQtWindow.tick_once`;
+* :func:`run_calibration_qt` — зеркальный по смыслу ``run_calibration``;
+* :func:`run_count_qt` — Qt-драйвер ``count --gui --backend qt``.
 
 Импорт PySide6 — ТОЛЬКО в этом модуле (лениво из CLI/тестов). ``apply_qt_env()``
 из gui.py для PySide6 НЕ вызывается: он настраивает QT_PLUGIN_PATH под bundled-Qt
@@ -36,8 +42,11 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QToolBar, QWidget
 
 import cv2   # BGR→RGB для canvas; обязательная зависимость проекта (не Qt-специфична)
 
+from .pipeline import Pipeline   # для аннотации run_count_qt
+
 from .calibrate import (DEFAULT_CACHE_FRAMES, load_calibration_config,
                         resolve_save_target, unscale_mouse)
+from .gui import GuiPlayer
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +316,199 @@ class CalibrateQtWindow(QMainWindow):
                 print("calibrate: выход БЕЗ сохранения ([a] не нажимался "
                       "или изменений не было)")
         event.accept()
+
+
+# ---------------------------------------------------------------------------
+# Окно подсчёта (count --gui --backend qt) — задача 17
+# ---------------------------------------------------------------------------
+
+class _CountCanvasState:
+    """Состояние отображения для :class:`VideoCanvas` в окне счёта.
+
+    Canvas здесь только показывает кадр (координаты мыши НЕ используются), поэтому
+    вместо контроллера передаётся лёгкий объект с ``width``/``height``/``scale``:
+    размеры последнего кадра, уже отмасштабированного ``GuiPlayer.tick()``
+    (``scale = 1.0`` — размер виджета совпадает с pixmap-ом; эффективный масштаб
+    окна = ``player.scale`` и меняется вместе с пресетами `,`/`.`).
+    """
+
+    def __init__(self) -> None:
+        self.width: int = 1
+        self.height: int = 1
+        self.scale: float = 1.0
+
+
+#: Кнопки тулбара окна счёта: (name, подпись, код клавиши cv2, checkable).
+#: Коды — те же, что у клавиш cv2-окна: пробел/+/−/,/. /q.
+_COUNT_BUTTON_DEFS: list[tuple[str, str, int, bool]] = [
+    ("pause", "Пауза", 32, True),
+    ("faster", "+скорость", ord("+"), False),
+    ("slower", "−скорость", ord("-"), False),
+    ("scale_down", "масштаб ↓", ord(","), False),
+    ("scale_up", "масштаб ↑", ord("."), False),
+    ("quit", "Выход", ord("q"), False),
+]
+
+
+class CountQtWindow(QMainWindow):
+    """QMainWindow окна подсчёта: canvas + QToolBar (6 кнопок) + статусбар.
+
+    Логика НЕ дублируется — всё состояние живёт в :class:`GuiPlayer` (общий с
+    cv2-режимом): кнопки вызывают ``player.handle_key(code)`` с кодами cv2
+    (пробел/+/−/,/. /q). Цикл — QTimer с интервалом ``1000/(fps*speed)``
+    (пересчитывается при смене speed; fps<=0 → 33 мс); пауза таймер НЕ
+    останавливает — ``player.tick()`` сам возвращает последний кадр (как cv2).
+    Тик — :meth:`tick_once` (вызывается таймером И вручную в тестах):
+    ``None`` из ``tick()`` → ``player.finalize(...)`` + :meth:`closeWindow`.
+    """
+
+    def __init__(self, player: GuiPlayer):
+        super().__init__()
+        self.player = player
+        self._closed = False   # QWidget.isClosed() нет — состояние ведём сами (closeEvent)
+        self.setWindowTitle(player.window_name)
+
+        # центральный виджет — тот же VideoCanvas; только отображение, мышь не нужна
+        self.canvas_state = _CountCanvasState()
+        self.canvas = VideoCanvas(self.canvas_state, self)
+        self.setCentralWidget(self.canvas)
+
+        # верхняя панель: QToolBar с кнопками (коды — как клавиши cv2-окна)
+        toolbar = QToolBar("Подсчёт", self)
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        self.addToolBar(toolbar)
+        self.actions: dict[str, QAction] = {}
+        for name, label, key, checkable in _COUNT_BUTTON_DEFS:
+            act = QAction(label, self)
+            act.setCheckable(checkable)
+            act.triggered.connect(
+                lambda _checked=False, n=name: self._on_button(n))
+            toolbar.addAction(act)
+            self.actions[name] = act
+
+        # статусбар: строка статуса плеера + последнее сообщение; обновляется каждый тик
+        self.statusBar().showMessage(self._status_text())
+
+        # цикл по таймеру: реалтайм fps/speed (как cv2-драйвер);
+        # fps неизвестен до первого tick → 33 мс, далее пересчёт в _refresh_ui
+        self.timer = QTimer(self)
+        self.timer.setInterval(33)
+        self.timer.timeout.connect(self.tick_once)
+
+    # ------------------------------------------------------------------ действия
+    @staticmethod
+    def _key_of(name: str) -> int:
+        for n, _label, key, _checkable in _COUNT_BUTTON_DEFS:
+            if n == name:
+                return key
+        raise KeyError(name)
+
+    def _on_button(self, name: str) -> None:
+        """Нажатие кнопки тулбара → ``player.handle_key(код cv2-клавиши)``."""
+        self.player.handle_key(self._key_of(name))
+        self._refresh_ui()
+
+    def tick_once(self) -> None:
+        """Один тик: ``view = player.tick()`` → canvas + статусбар.
+
+        ``None`` (EOF/stop) → ``player.finalize(...)`` + :meth:`closeWindow`.
+        Вызывается QTimer'ом и вручную (тесты).
+        """
+        view = self.player.tick()
+        if view is None:
+            self.player.finalize("окно закрыто (GUI)")
+            self.closeWindow()
+            return
+        st = self.canvas_state
+        h, w = int(view.shape[0]), int(view.shape[1])
+        st.width, st.height, st.scale = w, h, 1.0   # кадр уже отмасштабирован player'ом
+        self.canvas.show_frame(view)
+        self._refresh_ui()
+
+    def _refresh_ui(self) -> None:
+        """Синхронизировать подсветку «Пауза», интервал таймера и статусбар."""
+        p = self.player
+        act = self.actions["pause"]
+        if act.isChecked() != p._paused:
+            act.blockSignals(True)   # не дёргать handle_key при пересинхронизации
+            act.setChecked(p._paused)
+            act.blockSignals(False)
+        src = getattr(p.pipeline, "source", None)
+        fps = float(getattr(src, "fps", 0.0) or 0.0) if src is not None else 0.0
+        interval = (int(round(1000.0 / (fps * p.speed)))
+                    if fps > 0 and p.speed > 0 else 33)
+        self.timer.setInterval(max(1, min(interval, 1000)))
+        self.statusBar().showMessage(self._status_text())
+
+    def _status_text(self) -> str:
+        """Строка статусбара: ``GuiPlayer.status_text`` + последнее сообщение."""
+        p = self.player
+        proc_fps = (1.0 / p._proc_ema) if p._proc_ema > 0 else 0.0
+        txt = p.status_text(proc_fps, frame_index=p.frame_index)
+        if p.last_message:
+            txt += f" | {p.last_message}"
+        return txt
+
+    def closeWindow(self) -> None:
+        """Закрыть окно (closeEvent остановит таймер и завершит плеер)."""
+        self.close()
+
+    # ------------------------------------------------------------------ события
+    def keyPressEvent(self, event):
+        """Клавиатура — та же, что у cv2-окна: QKeyEvent → handle_key(код)."""
+        code = qt_key_to_cv2(event)
+        if code is not None:
+            self.player.handle_key(code)
+            self._refresh_ui()
+        else:
+            super().keyPressEvent(event)
+
+    @property
+    def is_closed(self) -> bool:
+        """Окно закрыто (closeEvent сработал)."""
+        return self._closed
+
+    def closeEvent(self, event):
+        """Выход: остановить таймер; финализация — идемпотентна (tick_once может
+        вызвать её раньше при EOF/«Выход»)."""
+        self._closed = True
+        self.timer.stop()
+        try:
+            self.player.finalize("окно закрыто (GUI)")
+        finally:
+            event.accept()
+
+
+# ---------------------------------------------------------------------------
+# Драйвер count --gui (задача 17)
+# ---------------------------------------------------------------------------
+
+def run_count_qt(pipeline: Pipeline, speed: float = 1.0,
+                 initial_scale: float = 1.0) -> int:
+    """Подсчёт в Qt-окне (PySide6): ``count --gui --backend qt``.
+
+    Создаёт QApplication (если нет), :class:`GuiPlayer` (без запуска cv2-run!) и
+    :class:`CountQtWindow`; цикл — QTimer окна, завершение — EOF/«Выход»
+    (``player.finalize`` в closeEvent). ``apply_qt_env()`` НЕ вызывается: он
+    настраивает QT_PLUGIN_PATH под bundled-Qt колеса opencv, что конфликтует с
+    плагинами PySide6.
+
+    :raises ImportError: PySide6 не импортируется (CLI проверяет заранее).
+    :returns: 0 — корректное завершение.
+    """
+    app = QApplication.instance() or QApplication(sys.argv)
+    player = GuiPlayer(pipeline, speed=speed, initial_scale=initial_scale)
+    win = CountQtWindow(player)
+    win.show()
+    win.timer.start()
+    try:
+        app.exec()
+    finally:
+        # closeEvent уже остановил таймер и завершил плеер; страховка — идемпотентно
+        if not win.is_closed:
+            win.close()
+    return 0
 
 
 # ---------------------------------------------------------------------------
