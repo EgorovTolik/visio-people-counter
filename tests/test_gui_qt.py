@@ -234,6 +234,20 @@ else:
             self.assertLess(max(c.red(), c.green(), c.blue()), 30)   # чёрный фон
 
 
+    class TestFrameUiHidden(_QtBase):
+        """Qt-окно: старая панель «на кадре» скрыта (ctrl.frame_ui=False)."""
+
+        def test_panel_not_drawn_and_clicks_pass_through(self):
+            win = self._open_window()
+            self.assertFalse(win.ctrl.frame_ui)          # окно отключает наложенную панель
+            win.tick()
+            self.assertEqual(win.ctrl.buttons, [])       # раскладка не строится → не рисуется
+            # клик в месте, где у cv2 была первая кнопка, НЕ запускает режим —
+            # координаты уходят в логику режима (режим None — ничего не происходит)
+            QTest.mouseClick(win.canvas, Qt.MouseButton.LeftButton, pos=QPoint(8, 8))
+            self.assertIsNone(win.ctrl.state.mode)
+
+
     class TestButtons(_QtBase):
         """Кнопки тулбара: trigger() → ctrl.on_button; подсветка checkable."""
 

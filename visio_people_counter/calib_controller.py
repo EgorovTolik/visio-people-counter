@@ -124,6 +124,10 @@ class CalibrationController:
         # сообщения / прочие флаги
         self.saved_once = False
         self._quit_requested = False
+        #: рисовать ли НА КАДРЕ старую панель (кнопки + статусная строка):
+        #: cv2-окно — True; Qt-окно — False (есть настоящий QToolBar/статусбар,
+        #: наложенная панель только мешает). Управляет step() и hit-test'ом в on_click.
+        self.frame_ui = True
         #: активные уведомления ``(текст, expires_at — time.monotonic)``; живут MESSAGE_TTL_SECONDS
         self.pending_msgs: list[tuple[str, float]] = []
         #: раскладка панели кнопок (обновляется каждым step() для hit-test кликов)
@@ -272,17 +276,21 @@ class CalibrationController:
             roi_txt = describe_roi(self.cfg.processing.roi)
             roi_label = f"ROI: {roi_txt} (правка — r)" if self.state.mode == "roi" \
                 else f"ROI: {roi_txt}"
-        self.buttons = draw_top_panel(img, self.state.counter_id, self.cfg.counters,
-                                      self.state.mode, self.mask_on, show_all=self.show_all,
-                                      scale=self.scale,
-                                      frame_index=(self.frame_indices[idx]
-                                                   if idx < len(self.frame_indices) else None),
-                                      roi_label=roi_label)
-        # красные сообщения — под строкой кнопок (панель заканчивается ~y=66);
+        if self.frame_ui:
+            self.buttons = draw_top_panel(img, self.state.counter_id, self.cfg.counters,
+                                          self.state.mode, self.mask_on, show_all=self.show_all,
+                                          scale=self.scale,
+                                          frame_index=(self.frame_indices[idx]
+                                                       if idx < len(self.frame_indices) else None),
+                                          roi_label=roi_label)
+            panel_y = 72   # сообщения — под строкой кнопок (панель заканчивается ~y=66)
+        else:
+            self.buttons = []   # Qt: панель не рисуем, клики по ней не ловим
+            panel_y = 10        # уведомления — сразу сверху кадра
         # живут MESSAGE_TTL_SECONDS секунд
         self.pending_msgs[:] = filter_expired_messages(self.pending_msgs, time.monotonic())
         for i, (msg, _exp) in enumerate(self.pending_msgs):
-            draw_notification(img, msg[:90], x=10, y=72 + 20 * i, size_px=14)
+            draw_notification(img, msg[:90], x=10, y=panel_y + 20 * i, size_px=14)
         if self.time_input_active:
             # буфер ввода времени дублируется на экране каждый кадр
             buf_str = "".join(str(d) for d in self.time_buf.digits) or "_"
@@ -310,10 +318,11 @@ class CalibrationController:
         иначе — логика текущего режима (:func:`calibrate.handle_size_click`),
         как до выноса.
         """
-        name = hit_button(self.buttons, x, y)
-        if name is not None:
-            self.on_button(name)
-            return
+        if self.frame_ui:
+            name = hit_button(self.buttons, x, y)
+            if name is not None:
+                self.on_button(name)
+                return
         try:
             for msg in handle_size_click(self.state, x, y, self.w, self.h):
                 self._notify(msg)

@@ -235,6 +235,9 @@ class CalibrateQtWindow(QMainWindow):
         self.ctrl = ctrl
         self._closed = False   # QWidget.isClosed() нет — состояние ведём сами (closeEvent)
         self.setWindowTitle(ctrl.window_name)
+        # Qt-окно: старая «нарисованная на кадре» панель не нужна — есть настоящий
+        # QToolBar и статусбар; отключаем её отображение и hit-test кликов.
+        ctrl.frame_ui = False
 
         # центральный виджет — canvas; мышь → координаты исходного кадра → ctrl
         self.canvas = VideoCanvas(ctrl, self)
