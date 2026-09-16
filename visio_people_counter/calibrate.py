@@ -1383,7 +1383,7 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         окно сразу показывает ROI-вид (рамка + подпись в статусе). Вызывается
         после проверки минимального размера прямоугольника.
         """
-        nonlocal pipe, detector, w, h, idx
+        nonlocal pipe, detector, w, h, idx, scale
         old = cfg.processing.roi
         if list(new_roi) == (list(old) if old is not None else None):
             state.mode = None
@@ -1407,6 +1407,12 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         pipe = new_pipe
         w, h = pipe.source.width, pipe.source.height
         detector = MotionDetector(cfg)   # модель фона под новый размер кадра
+        # авто-масштаб при новом (возможно, крошечном) размере: UI должен остаться доступным
+        new_scale = auto_ui_scale(w, h, scale)
+        if new_scale != scale:
+            scale = new_scale
+            print(f"calibrate: малое изображение {w}×{h} — масштаб окна → {scale:g}x")
+            _notify(f"малое изображение {w}×{h} — окно увеличено до {scale:g}x для доступного UI")
         if t_cur is not None and seek_supported:
             _seek_to(t_cur)              # сохранение позиции; при неудаче — возврат в начало
         else:
