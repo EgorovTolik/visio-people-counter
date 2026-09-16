@@ -669,6 +669,93 @@ class TestCalibrationSaveTarget(unittest.TestCase):
         self.assertEqual(p, Path("my/conf.yaml"))
 
 
+# ---------------------------------------------------------------------------
+# calibrate: автопоиск конфига рядом с видео — задача 12
+# ---------------------------------------------------------------------------
+
+class TestResolveCalibrateConfig(unittest.TestCase):
+    """resolve_calibrate_config: (входной конфиг или None=дефолты, цель сохранения)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+
+    def _video(self, name="demo.mp4"):
+        p = self.dir / name
+        p.write_bytes(b"x")   # содержимое не важно — только существование файла
+        return p
+
+    def test_explicit_config_wins(self):
+        from visio_people_counter.calibrate import resolve_calibrate_config
+        v = self._video()
+        (self.dir / "demo.config.yaml").write_text("x")
+        got = resolve_calibrate_config(str(v), "my/explicit.yaml")
+        self.assertEqual(got, (Path("my/explicit.yaml"), Path("my/explicit.yaml")))
+
+    def test_auto_config_next_to_video(self):
+        from visio_people_counter.calibrate import resolve_calibrate_config
+        v = self._video()
+        auto = self.dir / "demo.config.yaml"
+        auto.write_text("x")
+        got = resolve_calibrate_config(str(v), None)
+        # автоконфиг — и вход, и цель сохранения (правки не затирают блоки)
+        self.assertEqual(got, (auto, auto))
+
+    def test_no_auto_config_returns_none(self):
+        from visio_people_counter.calibrate import resolve_calibrate_config
+        v = self._video()
+        got = resolve_calibrate_config(str(v), None)
+        self.assertEqual(got, (None, None))
+
+    def test_video_none_returns_none(self):
+        from visio_people_counter.calibrate import resolve_calibrate_config
+        self.assertEqual(resolve_calibrate_config(None, None), (None, None))
+
+    def test_url_or_missing_file_returns_none(self):
+        """HLS/URL и несуществующий путь — без автопоиска (текущее поведение)."""
+        from visio_people_counter.calibrate import resolve_calibrate_config
+        self.assertEqual(
+            resolve_calibrate_config("https://cam/x.m3u8", None), (None, None))
+        self.assertEqual(
+            resolve_calibrate_config(str(self.dir / "нет.mp4"), None), (None, None))
+
+    def test_explicit_none_or_empty_not_treated_as_path(self):
+        from visio_people_counter.calibrate import resolve_calibrate_config
+        self.assertEqual(resolve_calibrate_config(None, ""), (None, None))
+
+
+# ---------------------------------------------------------------------------
+# calibrate: frame_start → время seek — задача 12
+# ---------------------------------------------------------------------------
+
+class TestFrameStartSeekTime(unittest.TestCase):
+    """frame_start_seek_time: чистое преобразование кадр → секунды (t = N / fps)."""
+
+    def test_three_frames_at_25_fps(self):
+        from visio_people_counter.calibrate import frame_start_seek_time
+        self.assertAlmostEqual(frame_start_seek_time(3, 25.0), 0.12)
+
+    def test_zero_frame_is_zero_seconds(self):
+        from visio_people_counter.calibrate import frame_start_seek_time
+        self.assertEqual(frame_start_seek_time(0, 30.0), 0.0)
+
+    def test_big_frame_int_fps(self):
+        from visio_people_counter.calibrate import frame_start_seek_time
+        self.assertAlmostEqual(frame_start_seek_time(125, 25), 5.0)
+
+    def test_unknown_fps_returns_none(self):
+        from visio_people_counter.calibrate import frame_start_seek_time
+        self.assertIsNone(frame_start_seek_time(10, 0.0))
+        self.assertIsNone(frame_start_seek_time(10, -1.0))
+
+    def test_bad_frame_start_raises(self):
+        from visio_people_counter.calibrate import frame_start_seek_time
+        for bad in (-3, 2.5, "3", True):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                frame_start_seek_time(bad, 25.0)
+
+
 class TestApplyQtEnv(unittest.TestCase):
     """apply_qt_env: встроенный Qt из колеса opencv должен видеть системный gtk3-плагин."""
 

@@ -957,6 +957,54 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
     return img
 
 
+def resolve_calibrate_config(video_path: Optional[str],
+                             explicit_config: Optional[str]
+                             ) -> tuple[Optional[Path], Optional[Path]]:
+    """(входной конфиг или None=дефолты, цель сохранения) — задача 12.
+
+    Порядок поиска входного конфига при ``calibrate``:
+
+    * ``explicit_config`` задан → ``(explicit, explicit)`` — явный ``--config``
+      используется и как вход, и как цель сохранения (как раньше);
+    * без явного ``--config`` и рядом с файлом видео есть
+      ``<имя_видео>.config.yaml`` (stem без расширения) → ``(авто, авто)``:
+      правки пишутся обратно в тот же файл — пользовательские блоки
+      (motion/objects/processing, в т.ч. frame_start/frame_end) НЕ затираются;
+    * иначе (видео — URL/HLS/не-файл, автоконфига нет или video_path не задан)
+      → ``(None, None)``: вход = дефолты, цель сохранения решает
+      :func:`calibration_save_target` как раньше.
+
+    Чистая функция — тестируется без окна (tests/test_gui_calibrate.py).
+    """
+    if explicit_config:
+        p = Path(explicit_config)
+        return p, p
+    if video_path:
+        v = Path(video_path)
+        if v.is_file():
+            auto = v.with_name(f"{v.stem}.config.yaml")
+            if auto.is_file():
+                return auto, auto
+    return None, None
+
+
+def frame_start_seek_time(frame_start: int, fps: float) -> Optional[float]:
+    """Номер кадра ``processing.frame_start`` → время seek в секундах (задача 12).
+
+    ``t = frame_start / fps`` (fps — нативный fps источника). Если fps <= 0
+    (длительность/fps неизвестны) → ``None``: переход пропускать с уведомлением.
+
+    :raises ValueError: frame_start не целое или < 0.
+    """
+    if not isinstance(frame_start, int) or isinstance(frame_start, bool):
+        raise ValueError(f"frame_start: ожидалось int, получено {frame_start!r}")
+    if frame_start < 0:
+        raise ValueError(f"frame_start: ожидалось >= 0, получено {frame_start!r}")
+    if fps <= 0:
+        return None
+    return float(frame_start) / float(fps)
+
+
 def calibration_save_target(video_type: str, video_path: str,
                             config_path: str | Path) -> Path:
     """Куда calibrate сохраняет конфиг при [a].
@@ -1088,6 +1136,29 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         time_input_active = True
         _notify(f"Время (сек): наберите цифры 0-9 | Enter=OK, ESC/q=отмена")
 
+    def _seek_to(t_s: float) -> bool:
+        """source.seek(t_s) + замена кэша кадрами после метки (общая логика seek).
+
+        Используется и клавишей [t] (:func:`_apply_time_seek`), и стартовым
+        переходом к ``processing.frame_start`` (задача 12). State (линии/зоны/
+        sizes/текущий счётчик) НЕ сбрасывается — только кэш кадров. Если после
+        метки нет ни одного кадра — возврат в начало, чтобы окно не осталось
+        без кадров.
+
+        :returns: True, если после метки кадры есть (idx=0); False — seek не
+            удался или за пределами видео (кэш уже возвращён в начало).
+        """
+        nonlocal idx
+        if not pipe.source.seek(t_s):
+            return False
+        n_loaded = _load_cache()   # читает от новой метки, ЗАМЕНЯЕТ frames/masks
+        idx = 0
+        if n_loaded == 0:
+            pipe.source.seek(0.0)
+            _load_cache()
+            return False
+        return True
+
     def _apply_time_seek() -> None:
         """Enter в режиме ввода: source.seek(N) и замена кэша кадрами после метки.
 
@@ -1095,7 +1166,7 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         Если после метки нет ни одного кадра — возврат в начало, чтобы окно не осталось
         без кадров.
         """
-        nonlocal idx, time_input_active
+        nonlocal time_input_active
         v = time_buf.value()
         if v is None:
             _notify("время не задано — наберите цифры 0-9")
@@ -1106,19 +1177,14 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         if clamped:
             _notify(f"время {v} с больше длительности файла — seek к {t_seek:.1f} с "
                     f"(конец − {cache_frames} кадр(ов))")
-        if not pipe.source.seek(t_seek):
-            time_input_active = False
-            _notify("seek недоступен для HLS/URL — только файл видео")
-            return
-        n_loaded = _load_cache()   # читает от новой метки, ЗАМЕНЯЕТ frames/masks
-        idx = 0
         time_input_active = False
-        if n_loaded == 0:
-            pipe.source.seek(0.0)
-            _load_cache()
-            _notify(f"seek к {v} c: после метки нет кадров — вернулся в начало")
+        if not _seek_to(t_seek):
+            if seek_supported:
+                _notify(f"seek к {v} c: после метки нет кадров — вернулся в начало")
+            else:
+                _notify("seek недоступен для HLS/URL — только файл видео")
         else:
-            _notify(f"seek к {v} c: загружено {n_loaded} кадр(ов)")
+            _notify(f"seek к {v} c: загружено {len(frames)} кадр(ов)")
 
     def _switch_counter(direction: int) -> None:
         """[<]/[>]/[ ] — переключение счётчика с загрузкой его геометрии."""
@@ -1242,6 +1308,27 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         if not _load_cache():   # начальная загрузка первых cache_frames кадров
             print("calibrate: ОШИБКА: не удалось прочитать ни одного кадра", file=sys.stderr)
             return 1
+        # processing.frame_start — сразу открыть этот кадр (задача 12): seek как [t],
+        # только для файла; если fps/seek недоступны или кадр за пределами видео —
+        # уведомление и старт с начала.
+        fs_frame = cfg.processing.frame_start
+        if fs_frame is not None:
+            if not seek_supported:
+                print("calibrate: processing.frame_start задан, но для HLS/URL "
+                      "случайного доступа нет — переход пропущен")
+            else:
+                t0 = frame_start_seek_time(fs_frame, pipe.source.fps)
+                if t0 is None:
+                    print("calibrate: fps источника <= 0 — переход к кадру "
+                          f"{fs_frame} (processing.frame_start) пропущен")
+                else:
+                    t0, _clamped = clamp_seek_time(
+                        t0, getattr(pipe.source, "duration", 0.0),
+                        cache_frames, pipe.source.fps)
+                    if _seek_to(t0):
+                        _notify(f"переход к кадру {fs_frame} (processing.frame_start)")
+                    else:
+                        _notify(f"кадр {fs_frame} за пределами видео — старт с начала")
         print(f"calibrate: загрузил {len(frames)} кадр(ов) {w}x{h}, "
               f"counter-id={counter_id!r}; [n/p] — листать, "
               f"{'[t] — время (seek), ' if seek_supported else ''}[a] — сохранить в {config_path}")
