@@ -91,8 +91,9 @@ def apply_qt_env() -> None:
     os.environ.setdefault("QT_QPA_PLATFORMTHEME", "gtk3")
 
 
-# до первого cv2.imshow/namedWindow (создание QApplication) — на момент импорта модуля
-apply_qt_env()
+# ВАЖНО: вызывается НЕ при импорте, а лениво в cv2-драйверах (GuiPlayer.run,
+# calibrate.run_calibration) — иначе QT_PLUGIN_PATH/QT_QPA_PLATFORMTHEME попали бы
+# в процесс и сломали PySide6-бэкенд (см. gui_qt._sanitize_env_for_pyside).
 
 
 def clamp_speed(speed: float) -> float:
@@ -467,6 +468,7 @@ class GuiPlayer:
         if not self.available():
             raise RuntimeError(self.unavailable_reason())
 
+        apply_qt_env()   # только для cv2-окна (до создания HighGUI/QApplication)
         pipe = self.pipeline
         if pipe.source is None:
             pipe.build()

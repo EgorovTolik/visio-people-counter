@@ -70,7 +70,7 @@ from .config import (
     ZoneCounterConfig,
     describe_roi,
 )
-from .gui import GuiPlayer   # окно/доступность GUI — только в драйвере run_calibration
+from .gui import GuiPlayer, apply_qt_env   # окно/доступность GUI — только в драйвере run_calibration
 from .text_overlay import put_text, text_width
 from .video_source import VideoSourceError
 
@@ -1197,6 +1197,7 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         ctrl.close()
         return 1
 
+    apply_qt_env()   # только для cv2-окна (до создания HighGUI/QApplication)
     cv2.namedWindow(ctrl.window_name)
 
     def on_mouse(event, x, y, flags, param):

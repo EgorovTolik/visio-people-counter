@@ -42,6 +42,26 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QToolBar, QWidget
 
 import cv2   # BGR→RGB для canvas; обязательная зависимость проекта (не Qt-специфична)
 
+
+def _sanitize_env_for_pyside() -> None:
+    """Убрать из окружения настройки, сделанные под bundled-Qt колеса OpenCV.
+
+    ``apply_qt_env`` (gui.py) добавляет в QT_PLUGIN_PATH системные плагины Qt5 —
+    для PySide6 (Qt6) они несовместимы: xcb-плагин Qt5 не грузится в Qt6 и окно
+    падает. PySide6 использует СВОИ плагины из wheel — чужие пути не нужны.
+    Вызывается ДО создания QApplication (в обоих entry points).
+    """
+    import os as _os
+    cur = _os.environ.get("QT_PLUGIN_PATH", "")
+    keep = [p for p in cur.split(_os.pathsep)
+            if p and ("/cv2/qt" not in p) and ("qt5/plugins" not in p)]
+    if keep:
+        _os.environ["QT_PLUGIN_PATH"] = _os.pathsep.join(keep)
+    else:
+        _os.environ.pop("QT_PLUGIN_PATH", None)
+    # тема берётся стандартным механизмом Qt6; принудительный gtk3 из cv2-пути не нужен
+    _os.environ.pop("QT_QPA_PLATFORMTHEME", None)
+
 from .pipeline import Pipeline   # для аннотации run_count_qt
 
 from .calibrate import (DEFAULT_CACHE_FRAMES, load_calibration_config,
@@ -497,6 +517,7 @@ def run_count_qt(pipeline: Pipeline, speed: float = 1.0,
     :raises ImportError: PySide6 не импортируется (CLI проверяет заранее).
     :returns: 0 — корректное завершение.
     """
+    _sanitize_env_for_pyside()
     app = QApplication.instance() or QApplication(sys.argv)
     player = GuiPlayer(pipeline, speed=speed, initial_scale=initial_scale)
     win = CountQtWindow(player)
@@ -559,6 +580,7 @@ def run_calibration_qt(config_path: str | Path, video: Optional[str] = None,
         ctrl.close()
         return 1
 
+    _sanitize_env_for_pyside()
     app = QApplication.instance() or QApplication(sys.argv)
     win = CalibrateQtWindow(ctrl)
     win.show()
