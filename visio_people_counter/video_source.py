@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -35,6 +36,32 @@ class VideoSourceError(Exception):
 def is_url(path_or_url: str) -> bool:
     """True — вход выглядит как URL-поток (HLS/RTSP/http), а не локальный файл."""
     return "://" in path_or_url
+
+
+def roi_crop_pixels(roi: list[float], width: int, height: int) -> tuple[int, int, int, int]:
+    """ROI в долях кадра ``[x, y, w, h]`` → пиксельный срез ``(x_px, y_px, w_px, h_px)``.
+
+    Чистая функция: округление до целых + защита от вырожденных случаев:
+    координаты зажимаются в границы кадра, ширина/высота не меньше 1 px и не
+    выходят за правый/нижний край (если доля < 1 px — берётся 1 px).
+
+    :param roi: [x, y, w, h], доли полного кадра (валидация значений — в config).
+    :raises ValueError: разрешение кадра <= 0 или roi не из 4 чисел.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"размер кадра: ожидалось w>0, h>0, получено {width}x{height}")
+    if len(roi) != 4:
+        raise ValueError(f"roi: ожидалось [x, y, w, h] (4 числа), получено {list(roi)!r}")
+    x = int(round(float(roi[0]) * width))
+    y = int(round(float(roi[1]) * height))
+    w = int(round(float(roi[2]) * width))
+    h = int(round(float(roi[3]) * height))
+    # зажим в границы кадра + минимум 1 px (защита от вырожденного 0-среза)
+    x = max(0, min(x, width - 1))
+    y = max(0, min(y, height - 1))
+    w = max(1, min(w, width - x))
+    h = max(1, min(h, height - y))
+    return (x, y, w, h)
 
 
 def ffprobe_info(path_or_url: str, timeout_s: float = 30.0) -> dict:
@@ -162,14 +189,18 @@ class FileSource(VideoSource):
         продолжить кадры с index=0).
     """
 
-    def __init__(self, path: str, loop_file: bool = False) -> None:
+    def __init__(self, path: str, loop_file: bool = False,
+                 roi: Optional[list[float]] = None) -> None:
         self._path = path
         self._loop = loop_file
+        self._roi = roi
         self._cap: Optional[cv2.VideoCapture] = None
         self._index = 0
         self._w = 0
         self._h = 0
         self._fps = 0.0
+        #: пиксельный ROI-срез (x, y, w, h) на полном кадре или None; для отладки.
+        self.roi_px: Optional[tuple[int, int, int, int]] = None
 
     def open(self) -> None:
         cap = cv2.VideoCapture(self._path)
@@ -181,7 +212,13 @@ class FileSource(VideoSource):
         fps = float(cap.get(cv2.CAP_PROP_FPS))
         if w <= 0 or h <= 0:
             raise VideoSourceError(f"{self._path!r}: ffprobe/cv2 не вернули разрешение ({w}x{h})")
-        self._w, self._h = w, h
+        self.roi_px = None
+        if self._roi:
+            # кроп на уровне источника: весь остальной код работает от размера ROI
+            self.roi_px = roi_crop_pixels(self._roi, w, h)
+            self._w, self._h = self.roi_px[2], self.roi_px[3]
+        else:
+            self._w, self._h = w, h
         self._fps = fps if fps > 0 else 0.0
         self._index = 0
 
@@ -200,6 +237,10 @@ class FileSource(VideoSource):
                 frame = frame2
             else:
                 return None
+        if self.roi_px is not None:
+            # ROI-срез кадра (NumPy): координаты — на полном кадре
+            _x, _y, _cw, _ch = self.roi_px
+            frame = frame[_y:_y + _ch, _x:_x + _cw].copy()
         t_video = (self._index / self._fps) if self._fps > 0 else None
         out = Frame(image=frame, index=self._index, t_wall=time.monotonic(), t_video=t_video)
         self._index += 1
@@ -269,6 +310,9 @@ class FfmpegPipeSource(VideoSource):
     :param path_or_url: путь к файлу или URL (HLS/RTSP/http).
     :param effective_fps: целевой fps; 0 = нативный.
     :param max_width: даунскейл до ширины; 0 = как в источнике.
+    :param roi: ROI ``[x, y, w, h]`` в долях ПОЛНОГО кадра (None — весь кадр);
+        кроп через ffmpeg ``-vf crop=w:h:x:y``, пиксели считаются один раз при
+        open() из разрешения ffprobe; width/height источника = размер ROI.
     :param reconnect_attempts: 0 = бесконечно, -1 = не переподключаться.
     :param reconnect_backoff_s: пауза между попытками, сек.
     :param bad_read_threshold: подряд неудачных read() -> считать обрывом.
@@ -285,10 +329,12 @@ class FfmpegPipeSource(VideoSource):
         reconnect_backoff_s: float = 5.0,
         bad_read_threshold: int = 10,
         on_reconnect: Optional[Callable[[], None]] = None,
+        roi: Optional[list[float]] = None,
     ) -> None:
         self._path_or_url = path_or_url
         self._effective_fps = effective_fps
         self._max_width = max_width
+        self._roi = roi
         self._reconnect_attempts = reconnect_attempts
         self._backoff_s = reconnect_backoff_s
         self._bad_read_threshold = bad_read_threshold
@@ -305,6 +351,8 @@ class FfmpegPipeSource(VideoSource):
         self._h = 0
         self._fps = 0.0
         self._index = 0
+        #: пиксельный ROI-срез (x, y, w, h) в разрешении ПОЛНОГО кадра или None.
+        self.roi_px: Optional[tuple[int, int, int, int]] = None
 
     # --- свойства -----------------------------------------------------------
 
@@ -345,12 +393,26 @@ class FfmpegPipeSource(VideoSource):
         src_w, src_h = info["width"], info["height"]
         if src_w <= 0 or src_h <= 0:
             raise VideoSourceError(f"{self._path_or_url!r}: ffprobe не вернул разрешение")
-        if self._max_width > 0 and self._max_width < src_w:
+        # ROI-кроп на уровне источника: пиксели считаются один раз из разрешения
+        # ffprobe (оно известно ДО старта ffmpeg). Если по какой-то причине срез
+        # нельзя вычислить — фолбэк «без кропа» + warning.
+        self.roi_px = None
+        base_w, base_h = src_w, src_h
+        if self._roi:
+            try:
+                cx, cy, cw, ch = roi_crop_pixels(self._roi, src_w, src_h)
+            except (ValueError, TypeError) as e:
+                print(f"FfmpegPipeSource: ROI {self._roi!r} не применим — работаю без кропа: {e}",
+                      file=sys.stderr, flush=True)
+            else:
+                self.roi_px = (cx, cy, cw, ch)
+                base_w, base_h = cw, ch
+        if self._max_width > 0 and self._max_width < base_w:
             # даунскейл до max_width, высота чётная (bgr24/rawvideo любят чётные)
             self._w = int(self._max_width)
-            self._h = max(2, int(round(src_h * self._max_width / src_w / 2)) * 2)
+            self._h = max(2, int(round(base_h * self._max_width / base_w / 2)) * 2)
         else:
-            self._w, self._h = src_w, src_h
+            self._w, self._h = base_w, base_h
         self._fps = info["fps"] or 0.0
         self._spawn()
 
@@ -384,9 +446,17 @@ class FfmpegPipeSource(VideoSource):
             "-rw_timeout", "5000000",
             "-i", self._path_or_url,
         ]
+        # размер после кропа (вход для даунскейла): с ним сравниваем, чтобы не
+        # добавлять лишний -s, когда выход уже равен размеру после crop
+        if self.roi_px is not None:
+            cx, cy, cw, ch = self.roi_px
+            cmd += ["-vf", f"crop={cw}:{ch}:{cx}:{cy}"]
+            base_size = (cw, ch)
+        else:
+            base_size = (self._probe["width"], self._probe["height"])
         if self._effective_fps > 0:
             cmd += ["-r", str(int(self._effective_fps))]
-        if (self._w, self._h) != (self._probe["width"], self._probe["height"]):
+        if (self._w, self._h) != base_size:
             cmd += ["-s", f"{self._w}x{self._h}"]
         cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
         return cmd

@@ -17,7 +17,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 from visio_people_counter.video_source import (  # noqa: E402
-    FileSource, FfmpegPipeSource, VideoSourceError, ffprobe_info,
+    FileSource, FfmpegPipeSource, VideoSourceError, ffprobe_info, roi_crop_pixels,
 )
 
 W, H, FPS, N_FRAMES = 960, 540, 30.0, 30
@@ -253,6 +253,106 @@ class TestFfmpegPipeSource(_VideoMixin, unittest.TestCase):
         with self.assertRaises(VideoSourceError):
             src.open()   # ffprobe не находит вход
 
+
+class TestRoiCropPixels(unittest.TestCase):
+    """Задача 13: roi_crop_pixels — доли кадра → пиксельный срез (чистая функция)."""
+
+    def test_basic(self):
+        self.assertEqual(roi_crop_pixels([0.25, 0.25, 0.5, 0.5], 960, 540),
+                         (240, 135, 480, 270))
+
+    def test_rounding(self):
+        # 0.3333*100 = 33.33 → 33; срез не выходит за кадр
+        x, y, w, h = roi_crop_pixels([0.3333, 0.6667, 0.25, 0.25], 100, 100)
+        self.assertEqual((x, y), (33, 67))
+        self.assertEqual((w, h), (25, 25))
+        self.assertLessEqual(x + w, 100)
+        self.assertLessEqual(y + h, 100)
+
+    def test_degenerate_sub_pixel_becomes_one_px(self):
+        # доля меньше пикселя → не 0, а минимум 1 px (защита от вырожденного среза)
+        x, y, w, h = roi_crop_pixels([0.5, 0.5, 0.0004, 0.0004], 960, 540)
+        self.assertGreaterEqual(w, 1)
+        self.assertGreaterEqual(h, 1)
+
+    def test_clamp_to_frame_edges(self):
+        # x + w > 1 в пикселях из-за округления → ширина сжимается до края кадра
+        x, y, w, h = roi_crop_pixels([0.99, 0.05, 0.2, 0.2], 100, 50)
+        self.assertEqual(x, 99)
+        self.assertLessEqual(w, 100 - x)
+        self.assertGreaterEqual(w, 1)
+
+    def test_full_frame(self):
+        self.assertEqual(roi_crop_pixels([0.001, 0.001, 0.999, 0.999], 1000, 1000),
+                         (1, 1, 999, 999))
+
+    def test_bad_frame_size_raises(self):
+        with self.assertRaises(ValueError):
+            roi_crop_pixels([0.1, 0.1, 0.5, 0.5], 0, 100)
+
+    def test_bad_roi_length_raises(self):
+        with self.assertRaises(ValueError):
+            roi_crop_pixels([0.1, 0.1, 0.5], 100, 100)
+
+
+class TestFileSourceRoi(_VideoMixin, unittest.TestCase):
+    """Задача 13: FileSource с roi — source.width/height = размер ROI, кроп NumPy-срезом."""
+
+    def test_width_height_are_roi_size(self):
+        with FileSource(str(self.video_path), roi=[0.25, 0.25, 0.5, 0.5]) as src:
+            self.assertEqual(src.width, W // 2)     # 480
+            self.assertEqual(src.height, H // 2)    # 270
+            f = src.read()
+            self.assertIsNotNone(f)
+            self.assertEqual(f.image.shape, (H // 2, W // 2, 3))
+
+    def test_crop_matches_numpy_slice_of_full_frame(self):
+        with FileSource(str(self.video_path)) as full:
+            frame_full = full.read().image
+        x, y, cw, ch = roi_crop_pixels([0.25, 0.25, 0.5, 0.5], W, H)
+        expected = frame_full[y:y + ch, x:x + cw]
+        with FileSource(str(self.video_path), roi=[0.25, 0.25, 0.5, 0.5]) as src:
+            cropped = src.read().image
+        self.assertTrue(np.array_equal(cropped, expected))
+
+    def test_no_roi_unchanged(self):
+        with FileSource(str(self.video_path)) as src:
+            self.assertEqual(src.width, W)
+            self.assertEqual(src.height, H)
+            self.assertIsNone(src.roi_px)
+            f = src.read()
+            self.assertEqual(f.image.shape, (H, W, 3))
+
+    def test_roi_px_attribute_set(self):
+        with FileSource(str(self.video_path), roi=[0.25, 0.25, 0.5, 0.5]) as src:
+            self.assertEqual(src.roi_px, (W // 4, H // 4, W // 2, H // 2))
+
+    def test_frames_count_same_as_without_roi(self):
+        with FileSource(str(self.video_path), roi=[0.1, 0.1, 0.8, 0.8]) as src:
+            n = 0
+            while src.read() is not None:
+                n += 1
+        self.assertEqual(n, N_FRAMES)
+
+
+class TestFfmpegPipeSourceRoi(_VideoMixin, unittest.TestCase):
+    """Задача 13: FfmpegPipeSource с roi — кроп через ffmpeg -vf crop на уровне источника."""
+
+    def test_width_height_and_frame_are_roi_size(self):
+        src = FfmpegPipeSource(str(self.video_path), roi=[0.25, 0.25, 0.5, 0.5])
+        self.addCleanup(src.close)
+        src.open()
+        self.assertEqual((src.width, src.height), (W // 2, H // 2))
+        f = src.read()
+        self.assertIsNotNone(f)
+        self.assertEqual(f.image.shape, (H // 2, W // 2, 3))
+
+    def test_no_roi_unchanged(self):
+        src = FfmpegPipeSource(str(self.video_path))
+        self.addCleanup(src.close)
+        src.open()
+        self.assertEqual((src.width, src.height), (W, H))
+        self.assertIsNone(src.roi_px)
 
 
 if __name__ == "__main__":

@@ -197,6 +197,45 @@ def _get_size_points(d: dict, key: str, path: str,
     return out
 
 
+def _get_roi(d: dict, key: str, path: str) -> Optional[list[float]]:
+    """ROI — один прямоугольник ``[x, y, w, h]`` в долях ПОЛНОГО кадра.
+
+    Отсутствует/null → None (весь кадр). Иначе — список ровно из 4 чисел,
+    каждое в (0..1], причём ``x + w <= 1`` и ``y + h <= 1``; иначе ConfigError.
+    Все координаты настроек (линии/зоны/size-точки) и событий считаются
+    относительно ROI — кроп применяется на уровне источника.
+    """
+    if key not in d or d[key] is None:
+        return None
+    v = d[key]
+    _require(
+        isinstance(v, (list, tuple)) and len(v) == 4,
+        f"{path}.{key}", "список из 4 чисел [x, y, w, h] (доли полного кадра)", v,
+    )
+    vals: list[float] = []
+    for i, comp in enumerate(v):
+        _require(
+            isinstance(comp, (int, float)) and not isinstance(comp, bool),
+            f"{path}.{key}[{i}]", "число", comp,
+        )
+        c = float(comp)
+        if not (0.0 < c <= 1.0):
+            raise ConfigError(
+                f"{path}.{key}[{i}]: ожидалось число в (0..1] (доля полного кадра), получено {comp!r}"
+            )
+        vals.append(c)
+    x, y, w, h = vals
+    if x + w > 1.0:
+        raise ConfigError(
+            f"{path}.{key}: x + w = {x + w:.4f} > 1 — ROI выходит за правый край кадра"
+        )
+    if y + h > 1.0:
+        raise ConfigError(
+            f"{path}.{key}: y + h = {y + h:.4f} > 1 — ROI выходит за нижний край кадра"
+        )
+    return vals
+
+
 def _get_range(d: dict, key: str, path: str, default: tuple[float, float], min_bound: float = 0.0) -> tuple[float, float]:
     """Диапазон [min, max] чисел (например aspect_ratio_range); обе части >= min_bound."""
     if key not in d:
@@ -295,12 +334,17 @@ class ProcessingConfig:
     max_width: int = 0                   # даунскейл до ширины; 0 = как в источнике
     frame_start: Optional[int] = None    # первый кадр подсчёта (0-based, включительно); null = без границы
     frame_end: Optional[int] = None      # последний кадр подсчёта (0-based, включительно); null = до конца
+    #: ROI — один глобальный прямоугольник [x, y, w, h] в долях ПОЛНОГО кадра;
+    #: None/отсутствует = весь кадр. Кроп применяется на уровне источника
+    #: (ffmpeg -vf crop / NumPy-срез), поэтому ВСЕ координаты настроек и событий
+    #: отсчитываются от ROI.
+    roi: Optional[list[float]] = None
 
     @classmethod
     def from_dict(cls, d: Any) -> "ProcessingConfig":
         d = _as_dict(d, "processing")
         _check_unknown_keys(
-            d, {"effective_fps", "max_width", "frame_start", "frame_end"}, "processing"
+            d, {"effective_fps", "max_width", "frame_start", "frame_end", "roi"}, "processing"
         )
         eff = _get_float(d, "effective_fps", "processing", 0.0)
         if eff < 0:
@@ -315,7 +359,8 @@ class ProcessingConfig:
                 f"processing.frame_start={fs} > processing.frame_end={fe}: "
                 f"ожидалось frame_start <= frame_end (номера кадров 0-based, обе границы включительно)"
             )
-        return cls(effective_fps=eff, max_width=mw, frame_start=fs, frame_end=fe)
+        roi = _get_roi(d, "roi", "processing")
+        return cls(effective_fps=eff, max_width=mw, frame_start=fs, frame_end=fe, roi=roi)
 
 
 def describe_frame_range(frame_start: Optional[int], frame_end: Optional[int]) -> str:
@@ -333,6 +378,24 @@ def describe_frame_range(frame_start: Optional[int], frame_end: Optional[int]) -
     s = "начало" if frame_start is None else str(frame_start)
     e = "конец" if frame_end is None else str(frame_end)
     return f"{s}–{e} (подсчёт)"
+
+
+def describe_roi(roi: Optional[list[float]]) -> str:
+    """Человекочитаемая строка ROI для финальной сводки и markdown-отчёта.
+
+    * ``None`` → ``нет``;
+    * иначе → ``x–x+w × y–y+h`` (доли полного кадра, 4 знака),
+      например ``0.2–0.8 × 0.3–0.7``.
+    """
+    if roi is None:
+        return "нет"
+    x, y, w, h = roi
+
+    def f(v: float) -> str:
+        s = f"{round(float(v), 4):g}"
+        return s
+
+    return f"{f(x)}–{f(round(x + w, 4))} × {f(y)}–{f(round(y + h, 4))}"
 
 
 @dataclass

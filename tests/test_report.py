@@ -91,6 +91,31 @@ class TestBuildReport(unittest.TestCase):
         self.assertIn("| н/д | out | 5 |", text)
 
 
+class TestBuildReportRoi(unittest.TestCase):
+    """Задача 13: строка ROI в markdown-отчёте (есть roi → диапазон, нет → «нет»)."""
+
+    def _cfg(self, roi=None) -> Config:
+        d = {
+            "video": {"type": "file", "path": "/a/b/demo.mp4"},
+            "counters": [{"id": "l", "type": "line",
+                          "a": [0.25, 0.35], "b": [0.75, 0.85]}],
+        }
+        if roi is not None:
+            d["processing"] = {"roi": roi}
+        return Config.from_dict(d, "<test>")
+
+    def test_roi_line_when_set(self):
+        text = build_report(self._cfg([0.1, 0.2, 0.8, 0.6]), [_ev("l", "in", 1)], META)
+        self.assertIn("- ROI: 0.1–0.9 × 0.2–0.8", text)
+        # примечание: координаты конфига/событий — в системе ROI
+        self.assertIn("в системе ROI", text)
+
+    def test_roi_none_when_absent(self):
+        text = build_report(self._cfg(), [_ev("l", "in", 1)], META)
+        self.assertIn("- ROI: нет", text)
+        self.assertNotIn("в системе ROI", text)
+
+
 class TestChooseReportPath(unittest.TestCase):
     def test_auto_path_for_file(self):
         p = choose_report_path(_make_cfg())

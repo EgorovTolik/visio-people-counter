@@ -14,6 +14,12 @@
   **Enter** / кнопка «size» — завершить набор size-точек; клик по УЖЕ НАРИСОВАННОЙ
   size-точке (hit-радиус ~15 px, только когда pending-клики нет) удаляет её, а
   **b** отменяет ПОСЛЕДНЮЮ size-точку (кнопки нет — конкретную мерку удаляют кликом по ней);
+* **r** + ДВА клика по углам прямоугольника / кнопка «roi» — режим «ROI»:
+  область обработки ``processing.roi`` в долях ПОЛНОГО кадра; **Enter** — принять
+  (источник переоткрывается с кропом, окно показывает ROI-вид с рамкой и подписью,
+  координаты линий/зон/size-точек и событий отсчитываются от ROI),
+  ESC/повторный **r** — отмена/заново; при изменении ROI — уведомление о том, что
+  геометрию счётчиков стоит проверить в режиме «все»;
 * **m** / кнопка «маска» — toggle показа текущей маски движения (live-подстройка порога);
 * **v** / кнопка «все» — toggle режима просмотра ВСЕХ счётчиков из конфига: каждая
   линия/зона рисуется поверх кадра с размером (линия — длина в px и нормализованная,
@@ -45,6 +51,7 @@
 и тестируется БЕЗ окна (tests/test_gui_calibrate.py).
 """
 
+
 from __future__ import annotations
 
 import math
@@ -62,6 +69,7 @@ from .config import (
     ConfigError,
     LineCounterConfig,
     ZoneCounterConfig,
+    describe_roi,
 )
 from .gui import GuiPlayer
 from .text_overlay import put_text, text_width
@@ -188,21 +196,23 @@ class CalibrationState:
     """Собранное в окне калибровки (чистое состояние — без cv2)."""
 
     counter_id: str = ""
-    mode: Optional[str] = None   # "line" | "zone" | "size" | None
+    mode: Optional[str] = None   # "line" | "zone" | "size" | "roi" | None
     line_points: list[tuple[float, float]] = field(default_factory=list)   # норм. (x, y)
     zone_points: list[tuple[float, float]] = field(default_factory=list)   # норм. (x, y)
     size_points: list[tuple[float, float, float]] = field(default_factory=list)  # [x_frac, y_frac, h_frac]
+    #: клики режиму «ROI» — углы прямоугольника (норм., относительно ПОЛНОГО кадра)
+    roi_points: list[tuple[float, float]] = field(default_factory=list)
     #: первый клик «мерки роста» (pending-пара): ждёт второй клик (верх/низ человека)
     size_first_point: Optional[tuple[float, float]] = None
 
     def set_mode(self, mode: str) -> None:
-        """Переключить режим ('l'/'z'/'s'); переключение очищает НОВЫЙ набор.
+        """Переключить режим ('l'/'z'/'s'/'r'); переключение очищает НОВЫЙ набор.
 
         Pending-пара size («первый клик мерки») сбрасывается при ЛЮБОЙ смене режима —
         она не должна переживать выход из режима «размер».
         """
-        if mode not in ("line", "zone", "size"):
-            raise ValueError(f"режим калибровки: ожидалось line/zone/size, получено {mode!r}")
+        if mode not in ("line", "zone", "size", "roi"):
+            raise ValueError(f"режим калибровки: ожидалось line/zone/size/roi, получено {mode!r}")
         self.size_first_point = None
         self.mode = mode
         if mode == "line":
@@ -211,6 +221,14 @@ class CalibrationState:
         elif mode == "zone":
             self.zone_points = []
             self.line_points = []
+        elif mode == "roi":
+            self.roi_points = []       # заново; существующий ROI подгружает вызывающий
+
+    def cancel_roi(self) -> None:
+        """ESC в режиме «ROI»: отмена рисования (остальное состояние не трогается)."""
+        self.mode = None
+        self.roi_points = []
+        self.size_first_point = None
 
     def handle_click(self, x_norm: float, y_norm: float) -> None:
         """Клик в текущем режиме (координаты уже нормализованы)."""
@@ -220,6 +238,10 @@ class CalibrationState:
             self.line_points.append((x_norm, y_norm))
         elif self.mode == "zone":
             self.zone_points.append((x_norm, y_norm))
+        elif self.mode == "roi":
+            if len(self.roi_points) >= 2:
+                self.roi_points = []   # третий клик — начать прямоугольник заново
+            self.roi_points.append((x_norm, y_norm))
         elif self.mode == "size":
             # «мерка роста»: этот клик — первый из пары (второй завершит точку);
             # если pending уже есть — пара НЕ перезаписывается (завершается через
@@ -237,6 +259,42 @@ class CalibrationState:
     def finish_size(self) -> None:
         """Enter в режиме 's': завершить набор size-точек (pending-пара сбрасывается)."""
         self.size_first_point = None
+
+    def finish_roi(self) -> list[float]:
+        """Enter в режиме 'roi': принять прямоугольник → ``[x, y, w, h]`` (норм., полный кадр).
+
+        Порядок кликов не важен. :raises ValueError: меньше 2 кликов.
+        """
+        if len(self.roi_points) < 2:
+            raise ValueError(
+                f"ROI: ожидалось 2 клика по углам, получено {len(self.roi_points)}")
+        return roi_from_two_clicks(self.roi_points[0], self.roi_points[1])
+
+
+def roi_from_two_clicks(p1: tuple[float, float], p2: tuple[float, float]) -> list[float]:
+    """Два клика по углам прямоугольника (порядок не важен) → нормализованный
+    ``[x, y, w, h]`` относительно ПОЛНОГО кадра (доли 0..1, округление до 4 знаков).
+
+    Защита: значения зажимаются так, чтобы ROI не выходил за кадр и не был
+    вырожденным; ровно 0 заменяется на :data:`ROI_EPS`, т.к. конфиг требует
+    все четыре числа в (0..1].
+    """
+    # конфиг требует все четыре числа в (0..1] — ровно 0 недопустим, берём ~1 px
+    eps = ROI_EPS
+    x = max(eps, round(min(float(p1[0]), float(p2[0])), 4))
+    y = max(eps, round(min(float(p1[1]), float(p2[1])), 4))
+    w = min(round(abs(float(p2[0]) - float(p1[0])), 4), round(1.0 - x, 4))
+    h = min(round(abs(float(p2[1]) - float(p1[1])), 4), round(1.0 - y, 4))
+    return [x, y, w, h]
+
+
+#: минимальное смещение ROI от края кадра (доля): конфиг требует (0..1], а клик
+#: точно по краю даёт 0 — вместо этого берётся этот epsilon (~1 px на HD-кадре).
+ROI_EPS = 0.0001
+
+#: минимальная сторона ROI (доля кадра): меньше — прямоугольник считается
+#: случайным двойным кликом и не применяется.
+MIN_ROI_FRACTION = 0.01
 
 
 #: пресеты масштаба ОТОБРАЖЕНИЯ окна (только imshow; обработка и координаты
@@ -729,11 +787,13 @@ def draw_all_counters(img: np.ndarray, counters, w: int, h: int,
 
 def counter_status_text(counter_id: str, counters,
                         scale: float = 1.0,
-                        frame_index: Optional[int] = None) -> str:
+                        frame_index: Optional[int] = None,
+                        roi_label: Optional[str] = None) -> str:
     """Строка статуса над кнопками: текущий счётчик, позиция в списке,
-    текущий масштаб отображения (``scale=…x``, меняется клавишами `,`/`.`)
-    и номер текущего кадра (``кадр N``, 0-based — совпадает с индексом
-    ``processing.frame_start/frame_end`` для задания интервала подсчёта)."""
+    текущий масштаб отображения (``scale=…x``, меняется клавишами `,`/`.`),
+    номер текущего кадра (``кадр N``, 0-based — совпадает с индексом
+    ``processing.frame_start/frame_end`` для задания интервала подсчёта) и
+    подпись ROI (``ROI: x–x+w × y–y+h``, если ``processing.roi`` задан)."""
     txt: Optional[str] = None
     if not counters:
         txt = "Счётчиков нет — нажмите кнопку +линия или +зона"
@@ -749,7 +809,10 @@ def counter_status_text(counter_id: str, counters,
             txt = f"Счётчик: {counter_id} (новый — появится в конфиге после [a])"
     if frame_index is not None:
         txt += f"   кадр {frame_index}"
-    return f"{txt}   scale={scale:g}x"
+    txt = f"{txt}   scale={scale:g}x"
+    if roi_label:
+        txt += f"   {roi_label}"
+    return txt
 
 
 #: Порядок и подписи кнопок панели (слева направо); name — ключ действия.
@@ -759,6 +822,7 @@ _BUTTON_LABELS: list[tuple[str, str]] = [
     ("line", "линия"),
     ("zone", "зона"),
     ("size", "размер"),
+    ("roi", "roi"),
     ("mask", "маска"),
     ("show_all", "все"),
     ("prev", "<"),
@@ -781,11 +845,12 @@ def layout_buttons(mode: Optional[str], mask_on: bool, *, show_all: bool = False
     """Раскладка строки кнопок панели (чистая функция, ширина текста — text_width).
 
     :returns: список ``(name, label, active, x0, y0, x1, y1)`` слева направо.
-        Активны кнопки текущего режима (линия/зона/size), маска при mask_on и
+        Активны кнопки текущего режима (линия/зона/size/roi), маска при mask_on и
         «все» при show_all; остальные — неактивны (они «моментальные» действия).
     """
     active_map = {"line": mode == "line", "zone": mode == "zone",
-                  "size": mode == "size", "mask": bool(mask_on),
+                  "size": mode == "size", "roi": mode == "roi",
+                  "mask": bool(mask_on),
                   "show_all": bool(show_all)}
     out: list[Button] = []
     x = x0
@@ -812,12 +877,14 @@ def hit_button(buttons: list[Button], x: int, y: int) -> Optional[str]:
 def draw_top_panel(img: np.ndarray, counter_id: str, counters,
                    mode: Optional[str], mask_on: bool,
                    show_all: bool = False, scale: float = 1.0,
-                   frame_index: Optional[int] = None) -> list[Button]:
-    """Нарисовать вверху кадра статусную строку (с ``scale=…x`` и ``кадр N``)
-    + панель кнопок; вернуть раскладку для hit-test в mouse-callback.
-    Текст — только через put_text (кириллица)."""
+                   frame_index: Optional[int] = None,
+                   roi_label: Optional[str] = None) -> list[Button]:
+    """Нарисовать вверху кадра статусную строку (с ``scale=…x``, ``кадр N`` и
+    подписью ROI, если задан) + панель кнопок; вернуть раскладку для hit-test
+    в mouse-callback. Текст — только через put_text (кириллица)."""
     put_text(img, counter_status_text(counter_id, counters, scale,
-                                      frame_index=frame_index), (10, 8),
+                                      frame_index=frame_index,
+                                      roi_label=roi_label), (10, 8),
              size_px=20, color=(255, 255, 255))
     font = 20
     buttons = layout_buttons(mode, mask_on, show_all=show_all, font_px=font)
@@ -856,6 +923,10 @@ _HINTS = {
              "Enter — завершить набор\n"
              "клик по существующей мерке (когда нет ожидающего 1-го клика) — удалить её; "
              "[b] — отменить последнюю"),
+    "roi": ("ROI: кликните ДВА угла прямоугольника области обработки; Enter — принять, "
+            "r/кнопка «roi» — заново, ESC — отмена\n"
+            "после принятия источник переоткрывается с кропом: координаты линий/зон/size-точек "
+            "и событий считаются ОТ ROI (проверьте их в режиме [v]се)"),
 }
 
 
@@ -884,11 +955,14 @@ def _dashed_line(img: np.ndarray, p1: tuple[int, int], p2: tuple[int, int],
 
 def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
                       mask: Optional[np.ndarray], w: int, h: int,
-                      mouse_pos: Optional[tuple[int, int]] = None) -> np.ndarray:
+                      mouse_pos: Optional[tuple[int, int]] = None,
+                      active_roi: Optional[list[float]] = None) -> np.ndarray:
     """Отрисовка состояния калибровки на копии кадра (чистая функция).
 
     ``mouse_pos`` — текущая позиция курсора (для live-превью pending «мерки роста»);
     None — превью не рисуется.
+    ``active_roi`` — принятый ROI из конфига: кадр уже является ROI-видом,
+    поэтому рисуем рамку по краям кадра (подпись — в статусной строке).
     """
     img = base.copy()
     if mask_on and mask is not None:
@@ -947,6 +1021,27 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
             put_text(img, f"{len_px}px ({pct}% кадра)",
                      (max(4, mx + 8), max(4, my - 10)), size_px=14,
                      color=(0, 165, 255))
+
+    # режим «ROI»: два клика по углам — зелёные маркеры + пунктирная рамка-превью
+    roi_pts = getattr(state, "roi_points", [])
+    if roi_pts:
+        rpts = [(int(round(px_ * w)), int(round(py_ * h))) for px_, py_ in roi_pts]
+        for p in rpts:
+            cv2.circle(img, p, 5, (0, 255, 0), -1)
+        if len(roi_pts) >= 2:
+            (ax, ay), (bx, by) = rpts[0], rpts[1]
+            rx0, ry0 = min(ax, bx), min(ay, by)
+            rx1, ry1 = max(ax, bx), max(ay, by)
+            cv2.rectangle(img, (rx0, ry0), (rx1, ry1), (0, 255, 0), 2, lineType=cv2.LINE_AA)
+            put_text(img, "ROI: Enter — принять | r — заново | ESC — отмена",
+                     (max(4, rx0), max(72, min(ry1 + 8, h - 20))),
+                     size_px=14, color=(0, 255, 0))
+
+    # принятый ROI: кадр — уже ROI-вид; рамка по краям (внутри 4 px) как напоминание
+    if active_roi is not None and state.mode != "roi":
+        m = 4
+        cv2.rectangle(img, (m, m), (w - 1 - m, h - 1 - m), (0, 255, 0), 3,
+                      lineType=cv2.LINE_AA)
 
     # подсказки внизу кадра (верх занят статусной строкой + панелью кнопок)
     hint_lines = _HINTS[state.mode].split("\n")
@@ -1230,7 +1325,11 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
     def _do_save() -> None:
         nonlocal saved_once
         try:
-            changed = apply_calibration(cfg, state)
+            changed = list(apply_calibration(cfg, state))
+            # ROI пишется в конфиг вместе с остальными блоками (как сейчас);
+            # если других изменений нет — roi единственное изменение
+            if not changed and cfg.processing.roi is not None:
+                changed.append(f"processing.roi: {describe_roi(cfg.processing.roi)}")
             if not changed:
                 _notify("ничего не менялось — нет собранных линий/зон/size-точек")
             else:
@@ -1252,6 +1351,69 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
             what = {"line": "линию", "zone": "зону"}[kind]
             _notify(f"текущий счётчик — другого типа: создан новый {new_id} для {what}")
 
+    def _begin_roi_mode() -> None:
+        """[r]/кнопка «roi» — режим «ROI»: два клика по углам, Enter — принять.
+
+        Повторный запуск при существующем ROI — правка: текущий прямоугольник
+        показывается в окне как стартовые углы (рисуется поверх, клик заново).
+        """
+        state.set_mode("roi")
+        old = cfg.processing.roi
+        if old is not None:
+            x, y, w_, h_ = old
+            state.roi_points = [(x, y), (round(x + w_, 4), round(y + h_, 4))]
+            _notify(f"ROI: правка существующего ({describe_roi(old)}) — кликните 2 угла заново "
+                    f"или Enter — оставить как есть")
+        else:
+            _notify("ROI: кликните ДВА угла области обработки; Enter — принять, ESC — отмена")
+
+    def _apply_roi_change(new_roi: list[float]) -> None:
+        """Enter в режиме «ROI»: принять [x,y,w,h] (норм. полный кадр).
+
+        При отличии от текущего ROI: источник переоткрывается с кропом
+        (новый Pipeline), текущая позиция по времени сохраняется, если возможно;
+        окно сразу показывает ROI-вид (рамка + подпись в статусе). Вызывается
+        после проверки минимального размера прямоугольника.
+        """
+        nonlocal pipe, detector, w, h, idx
+        old = cfg.processing.roi
+        if list(new_roi) == (list(old) if old is not None else None):
+            state.mode = None
+            state.roi_points = []
+            _notify(f"ROI без изменений: {describe_roi(new_roi)}")
+            return
+        # текущая позиция по времени (best effort; для HLS/без fps — с начала)
+        t_cur: Optional[float] = None
+        if idx < len(frame_indices) and pipe.source.fps > 0:
+            t_cur = float(frame_indices[idx]) / float(pipe.source.fps)
+        cfg.processing.roi = list(new_roi)
+        try:
+            new_pipe = Pipeline(cfg).build()
+        except (VideoSourceError, ConfigError) as e:
+            cfg.processing.roi = old   # откат: окно продолжает работать со старым источником
+            state.mode = None
+            state.roi_points = []
+            _notify(f"ROI не применён (источник не открылся): {e}")
+            return
+        pipe.close()
+        pipe = new_pipe
+        w, h = pipe.source.width, pipe.source.height
+        detector = MotionDetector(cfg)   # модель фона под новый размер кадра
+        if t_cur is not None and seek_supported:
+            _seek_to(t_cur)              # сохранение позиции; при неудаче — возврат в начало
+        else:
+            _load_cache()
+            idx = 0
+            if not frames:
+                _notify("ROI: после переоткрытия источника кадры не загрузились — "
+                        "проверьте поток")
+        state.mode = None
+        state.roi_points = []
+        print(f"calibrate: ROI изменён: {describe_roi(old) if old is not None else 'нет'} → "
+              f"{describe_roi(new_roi)} (источник переоткрыт с кропом, кадры {w}x{h})")
+        _notify("ROI изменён — проверьте линии/зоны (режим «все»): их координаты "
+                "отсчитываются от ROI")
+
     def _do_button(name: str) -> None:
         nonlocal mask_on, show_all
         if name == "line":
@@ -1260,6 +1422,8 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
             _set_draw_mode("zone")
         elif name == "size":
             state.set_mode("size")
+        elif name == "roi":
+            _begin_roi_mode()
         elif name == "mask":
             mask_on = not mask_on
         elif name == "show_all":
@@ -1329,6 +1493,11 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
                         _notify(f"переход к кадру {fs_frame} (processing.frame_start)")
                     else:
                         _notify(f"кадр {fs_frame} за пределами видео — старт с начала")
+        # ROI задан во входном конфиге: окно сразу на ROI-виде (источник уже кропит)
+        if cfg.processing.roi is not None:
+            print(f"calibrate: ROI применён из конфига: {describe_roi(cfg.processing.roi)} "
+                  f"(окно показывает ROI-вид; правка — клавиша r / кнопка «roi»)")
+            _notify(f"ROI применён из конфига: {describe_roi(cfg.processing.roi)}")
         print(f"calibrate: загрузил {len(frames)} кадр(ов) {w}x{h}, "
               f"counter-id={counter_id!r}; [n/p] — листать, "
               f"{'[t] — время (seek), ' if seek_supported else ''}[a] — сохранить в {config_path}")
@@ -1341,12 +1510,20 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
                 img = _draw_calibration(base, state, mask_on, masks[idx], w, h,
                                         mouse_pos=unscale_mouse(mouse_xy[0], mouse_xy[1],
                                                                 scale, w, h)
-                                        if mouse_xy[0] >= 0 else None)
+                                        if mouse_xy[0] >= 0 else None,
+                                        active_roi=cfg.processing.roi)
+                # подпись ROI в статусной строке (текущее значение из конфига)
+                roi_label = None
+                if cfg.processing.roi is not None:
+                    roi_txt = describe_roi(cfg.processing.roi)
+                    roi_label = f"ROI: {roi_txt} (правка — r)" if state.mode == "roi" \
+                        else f"ROI: {roi_txt}"
                 buttons = draw_top_panel(img, state.counter_id, cfg.counters,
                                          state.mode, mask_on, show_all=show_all,
                                          scale=scale,
                                          frame_index=(frame_indices[idx]
-                                                      if idx < len(frame_indices) else None))
+                                                      if idx < len(frame_indices) else None),
+                                         roi_label=roi_label)
                 # красные сообщения — под строкой кнопок (панель заканчивается ~y=66);
                 # живут MESSAGE_TTL_SECONDS секунд
                 pending_msgs[:] = filter_expired_messages(pending_msgs, time.monotonic())
@@ -1389,14 +1566,22 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
                     elif key in (ord("-"), 8, 127):   # '-' или Backspace (X11=127, Win=8)
                         time_buf.backspace()
                 elif key in (ord("q"), ord("Q"), 27):
-                    break
+                    if state.mode == "roi":
+                        # ESC в режиме «ROI» — отмена рисования (не выход из окна)
+                        state.cancel_roi()
+                        _notify("ROI: отменено (источник не переоткрывался)")
+                    else:
+                        break
                 elif key == ord("l"):
                     _set_draw_mode("line")
                 elif key == ord("z"):
                     _set_draw_mode("zone")
                 elif key == ord("s"):
                     state.set_mode("size")
-                elif key == 13:  # Enter — замкнуть зону / завершить size-точки
+                elif key == ord("r"):
+                    # повторный r — заново (или правка существующего ROI)
+                    _begin_roi_mode()
+                elif key == 13:  # Enter — замкнуть зону / завершить size-точки / принять ROI
                     if state.mode == "zone":
                         try:
                             state.finish_zone()
@@ -1405,6 +1590,17 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
                             _notify(str(e))
                     elif state.mode == "size":
                         state.finish_size()
+                    elif state.mode == "roi":
+                        try:
+                            new_roi = state.finish_roi()
+                        except ValueError as e:
+                            _notify(str(e))
+                        else:
+                            if min(new_roi[2], new_roi[3]) < MIN_ROI_FRACTION:
+                                _notify("ROI слишком маленький (сторона меньше 1% кадра) — "
+                                        "кликните углы заново")
+                            else:
+                                _apply_roi_change(new_roi)
                 elif key == ord("m"):
                     mask_on = not mask_on
                 elif key == ord("v"):   # «все» — toggle показа всех счётчиков (только визуал)
