@@ -71,7 +71,7 @@ from .config import (
     ZoneCounterConfig,
     describe_roi,
 )
-from .gui import GuiPlayer
+from .gui import GuiPlayer, auto_ui_scale
 from .text_overlay import put_text, text_width
 from .motion_detector import MotionDetector
 from .pipeline import Pipeline
@@ -1208,11 +1208,19 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
     saved_once = False
     pending_msgs: list[tuple[str, float]] = []  # (текст, expires_at — time.monotonic)
     buttons: list[Button] = []   # раскладка панели (обновляется каждый кадр отрисовкой)
-    scale = max(0.05, initial_scale)   # --scale: старт масштаба ОТОБРАЖЕНИЯ (клавиши `,`/`.`); обработка — в исходном
+    scale_base = max(0.05, initial_scale)   # --scale: старт масштаба ОТОБРАЖЕНИЯ (клавиши `,`/`.`); обработка — в исходном
 
     def _notify(msg: str) -> None:
         """Сообщение на экране: живёт MESSAGE_TTL_SECONDS секунд."""
         pending_msgs.append((msg, time.monotonic() + MESSAGE_TTL_SECONDS))
+
+    # задача 14: маленький кадр (маленький ROI) → авто-увеличение окна для доступного UI;
+    # user --scale — минимум; клавиши `,`/`.` продолжают работать поверх авто-значения
+    scale = auto_ui_scale(w, h, scale_base)
+    if scale > scale_base:
+        msg = f"малое изображение {w}×{h} — окно увеличено до {scale:g}x для доступного UI"
+        print(f"calibrate: {msg}")
+        _notify(msg)
 
     def _begin_time_input() -> None:
         """[t]/кнопка «время» — включить режим ввода времени для seek.

@@ -19,6 +19,7 @@ Headless-фолбэк: :meth:`GuiPlayer.available` — чистая провер
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import time
@@ -37,6 +38,35 @@ from .video_source import FfmpegPipeSource
 #: допустимый диапазон скорости воспроизведения (CLI --speed и клавиши +/-).
 MIN_SPEED = 0.25
 MAX_SPEED = 8.0
+
+#: задача 14 — авто-масштаб окна при маленьком кадре (маленький ROI):
+#: минимальный «размер окна» для доступного UI (панель кнопок + статусная строка)
+MIN_UI_W, MIN_UI_H = 640, 320
+#: потолок авто-увеличения
+MAX_AUTO_SCALE = 25.0
+
+
+def auto_ui_scale(src_w: int, src_h: int, user_scale: float) -> float:
+    """Масштаб ОТОБРАЖЕНИЯ: максимум(user_scale, того что вписывает кадр в MIN_UI_*).
+
+    Задача 14: при маленьком кадре (маленький ROI) автоматически поднять масштаб
+    отображения так, чтобы окно было ≥ ~640×320 и UI оставался доступным.
+
+    - кадр уже больше минимумов по обеим осям → user_scale без изменений;
+    - иначе required = max(MIN_UI_W/src_w, MIN_UI_H/src_h), округлённый ВВЕРХ
+      до 0.1, но не выше MAX_AUTO_SCALE и не ниже user_scale
+      (пользовательское --scale — минимум).
+
+    :param src_w: ширина кадра в px (ROI-размер после кропа); <= 0 → user_scale.
+    :param src_h: высота кадра в px; <= 0 → user_scale.
+    :param user_scale: пользовательский масштаб (--scale / initial_scale).
+    :returns: масштаб отображения в диапазоне [user_scale, MAX_AUTO_SCALE].
+    """
+    if src_w <= 0 or src_h <= 0:
+        return float(user_scale)
+    needed = max(MIN_UI_W / float(src_w), MIN_UI_H / float(src_h))
+    rounded = math.ceil(needed * 10.0 - 1e-9) / 10.0   # вверх до 0.1 (без FP-шума)
+    return min(MAX_AUTO_SCALE, max(float(user_scale), rounded))
 
 
 #: системная папка плагинов Qt5 (там живёт platformtheme gtk3/gtk2)
@@ -344,6 +374,9 @@ class GuiPlayer:
         if pipe.source is None:
             pipe.build()
         src = pipe.source
+        # задача 14: маленький кадр (маленький ROI) → авто-увеличение масштаба
+        # отображения, чтобы UI был доступен; user --scale — минимум; статус покажет scale=…x
+        self.scale = auto_ui_scale(src.width, src.height, self.scale)
         fps = float(src.fps or 0.0)
         if fps <= 0:
             fps = float(self.cfg.processing.effective_fps or 25.0)
