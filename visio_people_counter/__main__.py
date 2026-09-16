@@ -116,6 +116,12 @@ def _cache_frames_value(s: str) -> int:
     return v
 
 
+def _pyside_available() -> bool:
+    """Есть ли PySide6 в этой среде (без импорта самого Qt)."""
+    import importlib.util
+    return importlib.util.find_spec("PySide6") is not None
+
+
 def cmd_calibrate(args: argparse.Namespace) -> int:
     """GUI-калибровка линии/зоны/size-точек.
 
@@ -132,6 +138,34 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     elif not args.config:
         print(f"calibrate: найдён конфиг рядом с видео: {input_path} "
               f"(используется как вход и цель сохранения)")
+
+    # бэкенд окна (задача 16): явный --backend; иначе qt при установленном PySide6,
+    # иначе cv2-окно с предупреждением в stdout
+    if args.backend is None:
+        backend = "qt" if _pyside_available() else "cv2"
+        if backend == "cv2":
+            print("PySide6 не установлен — использую cv2-окно; для Qt: "
+                  ".venv/bin/pip install PySide6")
+    else:
+        backend = args.backend
+
+    if backend == "qt":
+        if not _pyside_available():
+            print("calibrate: ОШИБКА: --backend qt требует PySide6 (не установлен). "
+                  "Установите: .venv/bin/pip install PySide6 — или запускайте с "
+                  "--backend cv2", file=sys.stderr)
+            return 1
+        try:
+            from .gui_qt import run_calibration_qt   # лениво: Qt не тянется без запроса
+        except ImportError as e:
+            print(f"calibrate: ОШИБКА: PySide6 не импортируется ({e}); "
+                  f"установите заново (.venv/bin/pip install --force-reinstall PySide6) "
+                  f"или используйте --backend cv2", file=sys.stderr)
+            return 1
+        return run_calibration_qt(input_path, video=args.video,
+                                  counter_id=args.counter_id, save_to=save_to,
+                                  cache_frames=args.cache_frames,
+                                  initial_scale=args.scale)
     return run_calibration(input_path, video=args.video,
                            counter_id=args.counter_id, save_to=save_to,
                            cache_frames=args.cache_frames,
@@ -177,9 +211,12 @@ _CAL_EPILOG = """примеры значений:
   --counter-id     любой строковый id: line_1, zone_2, main_line (по умолчанию main_line)
   --scale          число 0.05..8: --scale 0.5 | --scale 2 ; пресеты в окне — `,` / `.`
   --cache-frames   целое >= 1: --cache-frames 50 | 300 (по умолчанию 100; ~6 МБ/кадр при 1080p)
+  --backend        окно калибратора: qt | cv2; по умолчанию qt при установленном PySide6,
+                   иначе cv2 с предупреждением (установка Qt: .venv/bin/pip install PySide6)
 
 примеры:
   visio_people_counter calibrate --video videos/demo.mp4
+  visio_people_counter calibrate --video x.mp4 --backend qt
   visio_people_counter calibrate --video /tmp/x.mp4 --config my.yaml --counter-id zone_2 \\
       --scale 0.75 --cache-frames 300"""
 
@@ -236,6 +273,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_cal.add_argument("--cache-frames", type=_cache_frames_value, default=100,
                        metavar="N", help="сколько кадров держать в кэше листа [n/p] и "
                                          "загружать после seek ([t]) (по умолчанию 100, >= 1)")
+    p_cal.add_argument("--backend", choices=["qt", "cv2"], default=None,
+                       metavar="{qt,cv2}",
+                       help="окно калибратора: Qt (PySide6) или cv2; по умолчанию qt, "
+                            "если установлен PySide6, иначе cv2 с предупреждением")
     p_cal.set_defaults(func=cmd_calibrate)
 
     return parser

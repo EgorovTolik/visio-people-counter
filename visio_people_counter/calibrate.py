@@ -1110,6 +1110,43 @@ def calibration_save_target(video_type: str, video_path: str,
     return Path(config_path)
 
 
+def load_calibration_config(config_path: str | Path) -> tuple[Optional[Config], Optional[str]]:
+    """Входной конфиг calibrate (общий для cv2- и Qt-драйверов — задача 16).
+
+    :returns: ``(cfg, None)`` — конфиг загружен (или дефолты при первом запуске);
+        ``(None, сообщение_ошибки)`` — конфиг нечитаем (сообщение уже напечатано в stderr).
+    """
+    if Path(config_path).is_file():
+        try:
+            return Config.load(config_path), None
+        except ConfigError as e:
+            print(f"calibrate: ошибка конфигурации: {e}", file=sys.stderr)
+            return None, str(e)
+    # первый запуск: файла ещё нет — калибруем по дефолтам и создадим файл при [a]
+    print(f"calibrate: файл {config_path} не найден — запускаю с настройками по умолчанию; "
+          f"результат будет сохранён рядом с видео (<имя_видео>.config.yaml) при [a] "
+          f"(остальные режимы требуют готовый конфиг)")
+    return Config.default(), None
+
+
+def resolve_save_target(cfg: Config, config_path: str | Path,
+                        save_to: Optional[str | Path]) -> Path:
+    """Куда calibrate сохраняет при [a] (общий для cv2- и Qt-драйверов — задача 16).
+
+    Явный ``save_to`` (--config) → строго туда; иначе рядом с файлом видео
+    (``<имя_видео>.config.yaml``); для HLS/URL — фолбэк на --config. Печатает цель.
+    """
+    if save_to is not None:
+        target = Path(save_to)
+    else:
+        target = calibration_save_target(cfg.video.type, cfg.video.path, config_path)
+        if cfg.video.type != "file":
+            print(f"calibrate: источник HLS/URL — конфиг будет сохранён в {target} "
+                  f"(«рядом с видео» для потока не определено)")
+    print(f"calibrate: результат [a] → {target}")
+    return target
+
+
 def run_calibration(config_path: str | Path, video: Optional[str] = None,
                     counter_id: str = "main_line",
                     window_name: str = "calibrate [l/z/s/m/a/q]",
@@ -1130,35 +1167,17 @@ def run_calibration(config_path: str | Path, video: Optional[str] = None,
         print(f"calibrate: ОШИБКА: {GuiPlayer.unavailable_reason()}", file=sys.stderr)
         return 1
 
-    if Path(config_path).is_file():
-        try:
-            cfg = Config.load(config_path)
-        except ConfigError as e:
-            print(f"calibrate: ошибка конфигурации: {e}", file=sys.stderr)
-            return 1
-    else:
-        # первый запуск: файла ещё нет — калибруем по дефолтам и создадим файл при [a]
-        cfg = Config.default()
-        print(f"calibrate: файл {config_path} не найден — запускаю с настройками по умолчанию; "
-              f"результат будет сохранён рядом с видео (<имя_видео>.config.yaml) при [a] "
-              f"(остальные режимы требуют готовый конфиг)")
+    # загрузка конфига и цель сохранения — общий helper (cv2- и Qt-драйверы, задача 16)
+    cfg, _err = load_calibration_config(config_path)
+    if cfg is None:
+        return 1
     if video:
         cfg.video.path = video
     if not cfg.video.path:
         print("calibrate: не задан источник видео — укажите --video или video.path в конфиге",
               file=sys.stderr)
         return 1
-
-    # Куда сохранять при [a]: явный save_to (--config) → строго туда; иначе рядом
-    # с файлом видео как <имя_видео>.config.yaml; для HLS/URL фолбэк на --config.
-    if save_to is not None:
-        save_target = Path(save_to)
-    else:
-        save_target = calibration_save_target(cfg.video.type, cfg.video.path, config_path)
-        if cfg.video.type != "file":
-            print(f"calibrate: источник HLS/URL — конфиг будет сохранён в {save_target} "
-                  f"(«рядом с видео» для потока не определено)")
-    print(f"calibrate: результат [a] → {save_target}")
+    save_target = resolve_save_target(cfg, config_path, save_to)
 
     # Вся логика «кадр за кадром» (источник, кэш кадров, детектор, оверлеи, кнопки,
     # seek, ROI-переоткрытие, save, уведомления) — в контроллере; cv2-окно здесь —

@@ -6,3 +6,4 @@ trackers==2.6.0
 PyYAML>=6.0
 Pillow>=10.0    # on-screen текст с кириллицей (cv2.putText её не умеет);
                 # без Pillow/GUI-шрифта подписи фолбэкатся в ASCII
+PySide6>=6.5   # опционально: Qt-бэкенд GUI (calibrate --backend qt)
