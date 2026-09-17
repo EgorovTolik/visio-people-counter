@@ -104,15 +104,11 @@ def cmd_count(args: argparse.Namespace) -> int:
         print(f"count: видеофайл не найден: {path!r}", file=sys.stderr)
         return 1
 
-    # thread-pipeline (задача 21): --threads только в headless; --queue-size задаёт
-    # размер очереди (default 50). GUI-режим обрабатывает кадры сам — threading не нужен.
+    # thread-pipeline (задача 21): --threads для headless и GUI; --queue-size задаёт
+    # размер очереди (default 50).
     use_threads = bool(args.threads)
     if args.queue_size < 1:
         print("count: --queue-size должен быть >= 1 — использую 1", file=sys.stderr)
-    if args.gui and use_threads:
-        print("count: --threads работает только в headless-режиме (без --gui; игнорирую)",
-              file=sys.stderr)
-        use_threads = False
 
     try:
         pipe = Pipeline(cfg, bench=args.bench, save_events=args.save_events,
@@ -143,8 +139,10 @@ def cmd_count(args: argparse.Namespace) -> int:
                           f"установите заново (.venv/bin/pip install --force-reinstall PySide6) "
                           f"или используйте --backend cv2", file=sys.stderr)
                     return 1
-                return run_count_qt(pipe, speed=args.speed, initial_scale=args.scale)
-            player = GuiPlayer(pipe, speed=args.speed, initial_scale=args.scale)
+                return run_count_qt(pipe, speed=args.speed, initial_scale=args.scale,
+                                    use_threads=args.threads, queue_size=args.queue_size)
+            player = GuiPlayer(pipe, speed=args.speed, initial_scale=args.scale,
+                               use_threads=args.threads, queue_size=args.queue_size)
             return player.run()
         if args.backend is not None:
             print("count: --backend работает только вместе с --gui (игнорирую)",

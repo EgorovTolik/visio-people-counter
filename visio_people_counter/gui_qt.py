@@ -631,7 +631,8 @@ class CountQtWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 def run_count_qt(pipeline: Pipeline, speed: float = 1.0,
-                 initial_scale: float = 1.0) -> int:
+                 initial_scale: float = 1.0,
+                 use_threads: bool = False, queue_size: int = 50) -> int:
     """Подсчёт в Qt-окне (PySide6): ``count --gui --backend qt``.
 
     Создаёт QApplication (если нет), :class:`GuiPlayer` (без запуска cv2-run!) и
@@ -645,7 +646,8 @@ def run_count_qt(pipeline: Pipeline, speed: float = 1.0,
     """
     _sanitize_env_for_pyside()
     app = QApplication.instance() or QApplication(sys.argv)
-    player = GuiPlayer(pipeline, speed=speed, initial_scale=initial_scale)
+    player = GuiPlayer(pipeline, speed=speed, initial_scale=initial_scale,
+                       use_threads=use_threads, queue_size=queue_size)
     win = CountQtWindow(player)
     win.show()
     win.timer.start()

@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import math
 import os
+import queue
 import sys
+import threading
 import time
 
 import cv2
@@ -261,7 +263,8 @@ class GuiPlayer:
 
     def __init__(self, pipeline: Pipeline, speed: float = 1.0,
                  window_name: str | None = None,
-                 initial_scale: float = 1.0) -> None:
+                 initial_scale: float = 1.0,
+                 use_threads: bool = False, queue_size: int = 50) -> None:
         if initial_scale <= 0:
             raise ValueError(f"initial_scale должен быть > 0, получено {initial_scale!r}")
         self.pipeline = pipeline
@@ -269,6 +272,12 @@ class GuiPlayer:
         self.speed: float = clamp_speed(speed)
         self.window_name = window_name or self.DEFAULT_WINDOW
         self.overlay = GuiOverlay(self.cfg.debug)
+        # thread-pipeline для GUI (задача 21): reader-поток + очередь кадров
+        self.use_threads = bool(use_threads)
+        self.queue_size = max(1, int(queue_size))
+        self._frame_queue: Optional["queue.Queue"] = None
+        self._reader_stop = threading.Event()
+        self._reader_thread: Optional[threading.Thread] = None
         # задачи 20: рисовать ли текст счётчиков/status_text на кадре. cv2-run и
         # headless — True (текст в кадр); Qt count-окно ставит False (текст в
         # статусбар, на кадре только гракция линии/зоны). Сеттер извне.
@@ -400,16 +409,31 @@ class GuiPlayer:
             # задача 14: маленький кадр → авто-увеличение масштаба отображения
             # (идемпотентно/монотонно — run() применяет тот же вызов перед циклом)
             self.scale = auto_ui_scale(pipe.source.width, pipe.source.height, self.scale)
+            # thread-pipeline: запускаем reader-поток после build() (один раз)
+            if self.use_threads and self._frame_queue is None:
+                self._start_reader()
         if self._paused:
             return self._scaled_view(self._last_view) if self._last_view is not None else None
         while not self._stop:
-            frame = pipe.source.read()
-            if frame is None:
-                # разрыв потока (не EOF): read() внутри уже отспал backoff
-                if isinstance(pipe.source, FfmpegPipeSource) and not pipe.source.exhausted:
-                    time.sleep(0.1)
+            if self._frame_queue is not None:
+                # thread-pipeline: кадр из очереди; sentinel None = EOF
+                try:
+                    frame = self._frame_queue.get(timeout=1.0)
+                except queue.Empty:
+                    if (self._reader_thread is not None
+                            and not self._reader_thread.is_alive()):
+                        return None   # reader умер и очередь пуста → EOF
                     continue
-                return None   # EOF файла / источник исчерпан
+                if frame is None:     # sentinel: EOF
+                    return None
+            else:
+                frame = pipe.source.read()
+                if frame is None:
+                    # разрыв потока (не EOF): read() внутри уже отспал backoff
+                    if isinstance(pipe.source, FfmpegPipeSource) and not pipe.source.exhausted:
+                        time.sleep(0.1)
+                        continue
+                    return None   # EOF файла / источник исчерпан
             break
         if self._stop:
             return None
@@ -446,6 +470,7 @@ class GuiPlayer:
         if self._finalized:
             return
         self._finalized = True
+        self._stop_reader()
         pipe = self.pipeline
         # markdown-отчёт — до close(): нужны fps/duration источника.
         # Сводка — только если конвейер собран (event_log создан в build());
@@ -454,6 +479,45 @@ class GuiPlayer:
             pipe._print_final(reason)
         pipe._write_report(reason)
         pipe.close()
+
+    # ------------------------------------------------------------------ thread-pipeline (GUI)
+    def _start_reader(self) -> None:
+        """Запустить reader-поток для GUI: читает кадры из pipe.source в очередь.
+
+        Вызывается один раз после build(). Thread safety: source.read() — только
+        здесь; detector/tracker/counters — только в main (tick()).
+        """
+        self._frame_queue = queue.Queue(maxsize=self.queue_size)
+        src = self.pipeline.source
+
+        def _target() -> None:
+            while not self._reader_stop.is_set():
+                frame = src.read()
+                if frame is None:
+                    if isinstance(src, FfmpegPipeSource) and not src.exhausted:
+                        time.sleep(0.2)
+                        continue
+                    break
+                try:
+                    self._frame_queue.put(frame, timeout=5.0)  # type: ignore[union-attr]
+                except queue.Full:
+                    self._reader_stop.set()
+                    break
+            try:
+                self._frame_queue.put(None, timeout=5.0)       # sentinel EOF  # type: ignore[union-attr]
+            except queue.Full:   # pragma: no cover
+                pass
+
+        self._reader_thread = threading.Thread(target=_target,
+                                               name="vpc-gui-reader", daemon=True)
+        self._reader_thread.start()
+
+    def _stop_reader(self) -> None:
+        """Остановить reader-поток (идемпотентно)."""
+        if self._reader_stop is not None:
+            self._reader_stop.set()
+        if self._reader_thread is not None and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=2.0)
 
     # ------------------------------------------------------------------ run
     def _process_frame(self, frame) -> tuple[list[Blob], list[TrackedObject]]:
