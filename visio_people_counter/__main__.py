@@ -104,8 +104,19 @@ def cmd_count(args: argparse.Namespace) -> int:
         print(f"count: видеофайл не найден: {path!r}", file=sys.stderr)
         return 1
 
+    # thread-pipeline (задача 21): --threads только в headless; --queue-size задаёт
+    # размер очереди (default 50). GUI-режим обрабатывает кадры сам — threading не нужен.
+    use_threads = bool(args.threads)
+    if args.queue_size < 1:
+        print("count: --queue-size должен быть >= 1 — использую 1", file=sys.stderr)
+    if args.gui and use_threads:
+        print("count: --threads работает только в headless-режиме (без --gui; игнорирую)",
+              file=sys.stderr)
+        use_threads = False
+
     try:
-        pipe = Pipeline(cfg, bench=args.bench, save_events=args.save_events)
+        pipe = Pipeline(cfg, bench=args.bench, save_events=args.save_events,
+                        use_threads=use_threads, queue_size=args.queue_size)
         if args.gui:
             # проверка доступности GUI — для обоих бэкендов (нет DISPLAY/WAYLAND)
             from .gui import GuiPlayer
@@ -241,9 +252,12 @@ _COUNT_EPILOG = """примеры значений:
   --speed    число 0.25..8 (только --gui): --speed 0.5 (медленнее), --speed 4 (быстрее)
   --backend  окно подсчёта: qt | cv2; по умолчанию qt при установленном PySide6,
              иначе cv2 с предупреждением (установка Qt: .venv/bin/pip install PySide6)
+  --threads  headless-режим: чтение кадров в отдельном потоке (producer-consumer)
+  --queue-size N размер очереди кадров для --threads (по умолчанию 50)
 
 примеры:
   visio_people_counter count --config videos/demo.config.yaml
+  visio_people_counter count --config cfg.yaml --threads --queue-size 100
   visio_people_counter count --config cfg.yaml --video /tmp/x.mp4 --bench
   visio_people_counter count --config cfg.yaml --gui --speed 1.5 --scale 0.75
   visio_people_counter count --config c.yaml --gui --backend qt --speed 2"""
@@ -301,6 +315,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_count.add_argument("--save-events", action="store_true",
                          help="записать таблицу событий в отчёт *.report.md "
                               "(по умолчанию — только итоги по счётчикам)")
+    p_count.add_argument("--threads", action="store_true",
+                         help="headless: producer-consumer threading — кадры читает "
+                              "отдельный поток (очередь --queue-size), обработка в main; "
+                              "I/O и CPU перекрываются")
+    p_count.add_argument("--queue-size", type=int, default=50, metavar="N",
+                         help="размер очереди кадров для thread-pipeline "
+                              "(по умолчанию 50, >= 1)")
     p_count.set_defaults(func=cmd_count)
 
     p_cal = sub.add_parser(

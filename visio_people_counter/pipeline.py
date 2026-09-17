@@ -38,6 +38,7 @@ counters/size_profile/event_log) и :meth:`BaseCounter.draw <visio_people_counte
 from __future__ import annotations
 
 import math
+import queue
 import signal
 import sys
 import threading
@@ -131,6 +132,11 @@ class Pipeline:
         переопределить ``video.path`` флагом ``--video``).
     :param bench: True — замерять время этапов detect/track/count на каждом кадре
         и печатать p50/p95 в финальной сводке.
+    :param use_threads: True — producer-consumer (задача 21): отдельный reader-поток
+        читает кадры из источника и кладёт в ``queue.Queue(maxsize=queue_size)``,
+        главный поток обрабатывает (detector/tracker/counters) — I/O и CPU
+        перекрываются. False (по умолчанию) — последовательный режим без изменений.
+    :param queue_size: размер очереди кадров для thread-режима (по умолчанию 50).
 
     Компоненты (source/detector/tracker/counters/size_profile/event_log) создаются
     в :meth:`build` (нужно разрешение/fps источника после ``open()``); ``run()``
@@ -138,10 +144,13 @@ class Pipeline:
     """
 
     def __init__(self, config: "Union[str, Path, Config]", bench: bool = False,
-                 save_events: bool = False) -> None:
+                 save_events: bool = False,
+                 use_threads: bool = False, queue_size: int = 50) -> None:
         self.cfg: Config = Config.load(config) if isinstance(config, (str, Path)) else config
         self.bench = bool(bench)
         self.save_events = bool(save_events)
+        self.use_threads = bool(use_threads)
+        self.queue_size = max(1, int(queue_size))
 
         # --- компоненты (заполняются в build()) ---------------------------------
         self.source: Optional[VideoSource] = None
@@ -411,6 +420,36 @@ class Pipeline:
         print("=== ОТЧЁТ ===", flush=True)
         print(str(path), flush=True)
 
+    # ------------------------------------------------------------------ thread pipeline (задача 21)
+    def _reader_loop(self, q: "queue.Queue", stop_event: threading.Event) -> None:
+        """Producer-поток: читает кадры из источника и кладёт в очередь.
+
+        ``source.read()`` вызывается ТОЛЬКО здесь (thread safety: детектор/трекер/
+        счётчики — только в processor, т.е. main thread). При EOF/ошибке или при
+        ``stop_event`` (SIGINT/остановка) ставит sentinel ``None`` и завершается.
+        Блокирующийся ``put`` с timeout: если consumer умер и очередь забита —
+        не вешаемся, а снимаем stop_event.
+        """
+        src = self.source
+        while not stop_event.is_set():
+            frame = src.read()
+            if frame is None:
+                # FfmpegPipeSource возвращает None и во время переподключения —
+                # EOF только когда источник исчерпан (как в последовательном run()).
+                if isinstance(src, FfmpegPipeSource) and not src.exhausted:
+                    time.sleep(0.2)  # backoff уже отоспал внутри read(); не крутим CPU
+                    continue
+                break
+            try:
+                q.put(frame, timeout=5.0)
+            except queue.Full:
+                stop_event.set()   # consumer не успевает — останавливаемся
+                break
+        try:
+            q.put(None, timeout=5.0)  # sentinel: EOF для processor
+        except queue.Full:           # pragma: no cover — consumer уже мёртв
+            pass
+
     # ------------------------------------------------------------------ run
     def _file_skip(self) -> int:
         """Каждый N-й кадр обрабатывать для FileSource при effective_fps > 0."""
@@ -423,6 +462,7 @@ class Pipeline:
 
     def run(self) -> int:
         """Запустить конвейер до EOF/stop. :returns: 0 — корректное завершение."""
+        self._reader_stop = None   # заполняется при use_threads=True (задача 21)
         if self.source is None:
             self.build()
 
@@ -436,7 +476,11 @@ class Pipeline:
         in_main_thread = threading.current_thread() is threading.main_thread()
         if in_main_thread:
             try:
-                prev_handler = signal.signal(signal.SIGINT, lambda *_a: setattr(self, "_stop", True))
+                def _on_sigint(*_a):
+                    setattr(self, "_stop", True)
+                    if self._reader_stop is not None:   # reader-поток тоже остановим
+                        self._reader_stop.set()
+                prev_handler = signal.signal(signal.SIGINT, _on_sigint)
             except (ValueError, OSError):  # pragma: no cover — нестандартная среда
                 prev_handler = None
 
@@ -445,16 +489,48 @@ class Pipeline:
         next_summary = t_start + interval if interval > 0 else float("inf")
         reason = "EOF"
 
+        # thread-pipeline (задача 21): reader-поток + очередь вместо прямого source.read()
+        frame_queue: Optional["queue.Queue"] = None
+        reader_done: Optional[threading.Event] = None
+        reader_thread: Optional[threading.Thread] = None
+        if self.use_threads:
+            self._reader_stop = threading.Event()
+            frame_queue = queue.Queue(maxsize=self.queue_size)
+            reader_done = threading.Event()
+
+            def _reader_target() -> None:
+                try:
+                    self._reader_loop(frame_queue, self._reader_stop)  # type: ignore[arg-type]
+                finally:
+                    reader_done.set()
+
+            reader_thread = threading.Thread(target=_reader_target,
+                                             name="vpc-frame-reader", daemon=True)
+            _emit(f"thread-pipeline: включён (очередь={self.queue_size}; "
+                  f"I/O в reader-потоке, обработка в main)")
+            reader_thread.start()
+
         try:
             while not self._stop:
-                frame = self.source.read()
-                if frame is None:
-                    # FfmpegPipeSource возвращает None и во время переподключения —
-                    # выходим из цикла только когда источник исчерпан.
-                    if isinstance(self.source, FfmpegPipeSource) and not self.source.exhausted:
-                        time.sleep(0.2)  # backoff уже отоспал внутри read(); не крутим CPU
+                if frame_queue is not None:
+                    # processor: кадр из очереди; sentinel None = EOF (reader закрыл)
+                    try:
+                        frame = frame_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        if reader_done.is_set():
+                            break  # очередь пуста и reader уже завершён → EOF
                         continue
-                    break
+                    if frame is None:      # sentinel
+                        break
+                else:
+                    frame = self.source.read()
+                    if frame is None:
+                        # FfmpegPipeSource возвращает None и во время переподключения —
+                        # выходим из цикла только когда источник исчерпан.
+                        if isinstance(self.source, FfmpegPipeSource) and not self.source.exhausted:
+                            time.sleep(0.2)  # backoff уже отоспал внутри read(); не крутим CPU
+                            continue
+                        break
                 if skip > 1 and frame.index % skip != 0:
                     continue
 
@@ -475,6 +551,10 @@ class Pipeline:
             if self._stop:
                 reason = "SIGINT (graceful stop)"
         finally:
+            # graceful shutdown: останавливаем reader и ждём его завершения
+            if reader_thread is not None and self._reader_stop is not None:
+                self._reader_stop.set()
+                reader_thread.join(timeout=10.0)
             self.duration_s = time.monotonic() - t_start
             self.avg_fps = self.frames_processed / max(1e-6, self.duration_s)
             self._print_final(reason)

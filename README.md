@@ -107,6 +107,8 @@ processing:
 .venv/bin/python -m visio_people_counter count --config config.yaml --video https://cam.example.com/live/stream.m3u8
 # бенчмарк: время этапов detect/track/count, p50/p95 в финале
 .venv/bin/python -m visio_people_counter count --config config.yaml --bench
+# thread-pipeline (headless): кадры читает отдельный поток в очередь, обработка — в main (I/O и CPU перекрываются)
+.venv/bin/python -m visio_people_counter count --config config.yaml --threads --queue-size 100
 ```
 
 Завершение: EOF файла → финальная сводка; стрим → `Ctrl+C` (SIGINT) — graceful stop
