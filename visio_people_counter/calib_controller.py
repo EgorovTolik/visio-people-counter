@@ -540,6 +540,27 @@ class CalibrationController:
         else:
             self._notify(f"seek к {v} c: загружено {len(self.frames)} кадр(ов)")
 
+    def apply_time_value(self, seconds: float) -> None:
+        """Публичный seek к заданному времени (сек), без клавиатурного ввода.
+
+        Для Qt-диалога: принимает float (дробные секунды поддерживаются),
+        применяет clamp + seek, сбрасывает time_input_active.
+        """
+        self.time_input_active = False
+        if not self.seek_supported:
+            self._notify("seek недоступен для HLS/URL — только файл видео")
+            return
+        assert self._pipe is not None
+        t_seek, clamped = clamp_seek_time(
+            float(seconds), getattr(self._pipe.source, "duration", 0.0),
+            self.cache_frames, self._pipe.source.fps)
+        if clamped:
+            self._notify(f"время {seconds:.1f} с больше длительности — seek к {t_seek:.1f} с")
+        if not self._seek_to(t_seek):
+            self._notify(f"seek к {seconds:.1f} c: после метки нет кадров — вернулся в начало")
+        else:
+            self._notify(f"seek к {t_seek:.1f} с (кадр {self.frame_index})")
+
     # ------------------------------------------------------------------ счётчики
     def _switch_counter(self, direction: int) -> None:
         """[<]/[>]/[ ] — переключение счётчика с загрузкой его геометрии."""

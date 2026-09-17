@@ -41,7 +41,8 @@ import numpy as np
 from PySide6.QtCore import QPoint, Qt, QTimer
 # QAction — в QtGui с Qt6 (в QtWidgets только deprecated-алиас)
 from PySide6.QtGui import QAction, QImage, QPixmap
-from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QToolBar, QWidget
+from PySide6.QtWidgets import (QApplication, QInputDialog, QLineEdit,
+                               QMainWindow, QLabel, QToolBar, QWidget)
 
 import cv2   # BGR→RGB для canvas; обязательная зависимость проекта (не Qt-специфична)
 
@@ -367,6 +368,11 @@ class CalibrateQtWindow(QMainWindow):
         pending-мерка, подсказка режима ROI — всё через чистые функции calibrate.
         Строки соединяются ``" | "``; пустая строка, если нечего показывать."""
         c = self.ctrl
+        # режим ввода времени (приоритет над всеми подсказками режима)
+        if c.time_input_active:
+            buf_str = "".join(str(d) for d in c.time_buf.digits) or "_"
+            return f"Время (сек): {buf_str} | Enter=OK, ESC/q=отмена"
+
         state = c.state
         parts: list[str] = []
         parts.extend(hint_lines(state.mode))
@@ -388,13 +394,32 @@ class CalibrateQtWindow(QMainWindow):
 
     # ------------------------------------------------------------------ события
     def keyPressEvent(self, event):
-        """Клавиатура — единая точка окна: QKeyEvent → код on_key."""
+        """Клавиатура — единая точка окна: QKeyEvent → код on_key.
+
+        Клавиша 't' перехватывается: вместо клавиатурного ввода времени
+        показывается модальный QDialog с полем (поддержка дробных секунд).
+        """
         code = qt_key_to_cv2(event)
-        if code is not None:
-            self.ctrl.on_key(code)
-            self._refresh_ui()
-        else:
+        if code is None:
             super().keyPressEvent(event)
+            return
+        if code == ord("t") and self.ctrl.seek_supported:
+            # модальный диалог ввода времени (дробные секунды: 1.5, 2, 0,75)
+            text, ok = QInputDialog.getText(
+                self, "Время (сек)", "Секунды до перемотки:",
+                QLineEdit.EchoMode.Normal, "")
+            if ok and text.strip():
+                try:
+                    val = float(text.strip().replace(",", "."))
+                    if val < 0:
+                        val = 0.0
+                    self.ctrl.apply_time_value(val)
+                except ValueError:
+                    pass   # невалидный ввод — игнорируем
+            self._refresh_ui()
+            return
+        self.ctrl.on_key(code)
+        self._refresh_ui()
 
     @property
     def is_closed(self) -> bool:
