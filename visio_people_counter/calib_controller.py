@@ -266,15 +266,10 @@ class CalibrationController:
         if self._quit_requested or not self.frames:
             return None
         idx = self._idx
-        # Компенсатор зума: UI-элементы рисуем в исходном кадре размером /scale,
-        # чтобы после единого ресайза img на factor scale их on-screen размер был
-        # постоянным (видео масштабируется вместе со всем кадром).
-        ui_scale = max(0.25, min(4.0, 1.0 / self.scale))
         img = _draw_calibration(self.frames[idx], self.state, self.mask_on,
                                 self.masks[idx], self.w, self.h,
                                 mouse_pos=self._mouse,
-                                active_roi=self.cfg.processing.roi,
-                                ui_scale=ui_scale)
+                                active_roi=self.cfg.processing.roi)
         # подпись ROI в статусной строке (текущее значение из конфига)
         roi_label = None
         if self.cfg.processing.roi is not None:
@@ -287,8 +282,7 @@ class CalibrationController:
                                           scale=self.scale,
                                           frame_index=(self.frame_indices[idx]
                                                        if idx < len(self.frame_indices) else None),
-                                          roi_label=roi_label,
-                                          ui_scale=ui_scale)
+                                          roi_label=roi_label)
             panel_y = 72   # сообщения — под строкой кнопок (панель заканчивается ~y=66)
         else:
             self.buttons = []   # Qt: панель не рисуем, клики по ней не ловим
@@ -296,8 +290,7 @@ class CalibrationController:
         # живут MESSAGE_TTL_SECONDS секунд
         self.pending_msgs[:] = filter_expired_messages(self.pending_msgs, time.monotonic())
         for i, (msg, _exp) in enumerate(self.pending_msgs):
-            draw_notification(img, msg[:90], x=10, y=panel_y + 20 * i,
-                              size_px=max(10, int(round(14 * ui_scale))))
+            draw_notification(img, msg[:90], x=10, y=panel_y + 20 * i, size_px=14)
         if self.time_input_active:
             # буфер ввода времени дублируется на экране каждый кадр
             buf_str = "".join(str(d) for d in self.time_buf.digits) or "_"
