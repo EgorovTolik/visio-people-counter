@@ -72,7 +72,7 @@ from .calibrate import (DEFAULT_CACHE_FRAMES, counter_status_text, hint_lines,
                         roi_mode_hint, resolve_save_target, size_point_label,
                         unscale_mouse)
 from .config import describe_roi
-from .gui import GuiPlayer
+from .gui import GuiPlayer, counters_status_line
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +463,9 @@ class CountQtWindow(QMainWindow):
         super().__init__()
         self.player = player
         self._closed = False   # QWidget.isClosed() нет — состояние ведём сами (closeEvent)
+        # задачи 20: текст счётчиков/статуса переносится в статусбар → на кадре
+        # только гракция линии/зоны; overlay рисуется с with_text=False
+        player.overlay_with_text = False
         self.setWindowTitle(player.window_name)
 
         # центральный виджет: тот же VideoCanvas (только отображение) + пустая
@@ -551,10 +554,19 @@ class CountQtWindow(QMainWindow):
         self.statusBar().showMessage(self._status_text())
 
     def _status_text(self) -> str:
-        """Строка статусбара: ``GuiPlayer.status_text`` + последнее сообщение."""
+        """Строка статусбара: ``GuiPlayer.status_text`` + счётчики (задача 20)
+        + последнее сообщение.
+
+        Счётчики берутся из ``player.pipeline.counters`` через
+        :func:`visio_people_counter.gui.counters_status_line` — задачи 20
+        (текст счётчиков переносится из кадра в статусбар). Обновляется каждый
+        тик: :meth:`tick_once` → :meth:`_refresh_ui` → ``showMessage``."""
         p = self.player
         proc_fps = (1.0 / p._proc_ema) if p._proc_ema > 0 else 0.0
         txt = p.status_text(proc_fps, frame_index=p.frame_index)
+        cs_line = counters_status_line(getattr(p.pipeline, "counters", None))
+        if cs_line:
+            txt += f" | {cs_line}"
         if p.last_message:
             txt += f" | {p.last_message}"
         return txt

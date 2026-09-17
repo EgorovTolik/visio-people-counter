@@ -124,6 +124,24 @@ def _emit(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# counters_status_line — чистая строка счётчиков для Qt-статусбара (задача 20)
+# ---------------------------------------------------------------------------
+
+def counters_status_line(counters: list[BaseCounter]) -> str:
+    """Сводка счётчиков в одну строку для Qt-статусбара.
+
+    Формат: «счётчики: <id>: in=N out=M | <id2>: in=N out=M» (для ``total``-
+    режимов — «<id>: total=N»). Строки счётчиков соединяются ``" | "``;
+    пустая строка, если counters нет. Значения берутся актуальные на момент
+    вызова (``BaseCounter.label_text()`` + текущие in/out/total). Не рисует —
+    только чистая строка для статусбара.
+    """
+    if not counters:
+        return ""
+    return "счётчики: " + " | ".join(c.label_text() for c in counters)
+
+
+# ---------------------------------------------------------------------------
 # Overlay (чистая отрисовка — без imshow)
 # ---------------------------------------------------------------------------
 
@@ -146,7 +164,8 @@ class GuiOverlay:
              blobs: list[Blob] | None = None,
              mask: np.ndarray | None = None,
              counters: list[BaseCounter] | None = None,
-             status_text: str = "") -> np.ndarray:
+             status_text: str = "",
+             with_text: bool = True) -> np.ndarray:
         """Нарисовать overlay на BGR-кадр (in-place) и вернуть его.
 
         :param frame: кадр (h, w, 3) uint8 — модифицируется на месте.
@@ -155,7 +174,11 @@ class GuiOverlay:
         :param mask: маска движения 0/255 того же размера (``show_mask`` → микс 50/50).
         :param counters: счётчики (``show_counters``): линия/зона через
             ``counter.draw`` + крупные текущие in/out в левом верхнем углу.
-        :param status_text: строка статуса справа сверху (скорость, PAUSED...).
+        :param status_text: строка статуса справа сверху (скорость, PAUSED...);
+            рисуется на кадре только при with_text=True (в Qt-окне — в статусбаре).
+        :param with_text: рисовать ли текст счётчиков (in/out) и status_text на
+            кадре. False — оставить графику линии/зоны и blob/bbox/mask;
+            задачи 20.
         """
         if frame is None or frame.size == 0:
             return frame
@@ -183,19 +206,22 @@ class GuiOverlay:
                 cv2.putText(frame, label, (tx, ty), self.FONT,
                             max(self.MIN_FONT_SCALE, 0.6), color, 2, cv2.LINE_AA)
 
-        # 4) счётчики: линия/зона (line_counter.draw) + крупные in/out в углу
+        # 4) счётчики: линия/зона (line_counter.draw) — всегда; крупные in/out
+        #    в углу — только при with_text=True (в Qt-окне текст переносится
+        #    в статусбар, задачи 20)
         if self.debug.show_counters and counters:
             for c in counters:
                 c.draw(frame)
-            y = 36
-            for c in counters:
-                # put_text: кириллические id счётчиков тоже отрисовываются (PIL/TTF);
-                # чёрная тень включена — читаемость над ярким фоном
-                put_text(frame, c.label_text(), (10, y), size_px=22,
-                         color=(255, 255, 255))
-                y += 34
+            if with_text:
+                y = 36
+                for c in counters:
+                    # put_text: кириллические id счётчиков тоже отрисовываются (PIL/TTF);
+                    # чёрная тень включена — читаемость над ярким фоном
+                    put_text(frame, c.label_text(), (10, y), size_px=22,
+                             color=(255, 255, 255))
+                    y += 34
 
-        if status_text:
+        if with_text and status_text:
             w = frame.shape[1]
             tw = text_width(status_text, size_px=16)
             put_text(frame, status_text, (max(0, w - tw - 10), 12),
@@ -243,6 +269,10 @@ class GuiPlayer:
         self.speed: float = clamp_speed(speed)
         self.window_name = window_name or self.DEFAULT_WINDOW
         self.overlay = GuiOverlay(self.cfg.debug)
+        # задачи 20: рисовать ли текст счётчиков/status_text на кадре. cv2-run и
+        # headless — True (текст в кадр); Qt count-окно ставит False (текст в
+        # статусбар, на кадре только гракция линии/зоны). Сеттер извне.
+        self.overlay_with_text = True
         #: масштаб ОТОБРАЖЕНИЯ (клавиши `,`/`.`; старт — initial_scale/--scale):
         #: применяем только перед imshow, обработка/детекция — всегда в исходном разрешении
         self.scale: float = initial_scale
@@ -396,7 +426,8 @@ class GuiPlayer:
             frame.image, objects=objects, blobs=blobs, mask=mask,
             counters=pipe.counters,
             status_text=self.status_text(1.0 / max(1e-6, self._proc_ema),
-                                         frame_index=frame.index))
+                                         frame_index=frame.index),
+            with_text=self.overlay_with_text)
         # отладочные кадры с overlay (cfg.debug.save_debug_frames_dir)
         dbg = self.cfg.debug
         if dbg.save_debug_frames_dir and \
