@@ -154,7 +154,9 @@ class Pipeline:
 
         # --- компоненты (заполняются в build()) ---------------------------------
         self.source: Optional[VideoSource] = None
-        self.detector: Optional[MotionDetector] = None
+        # MotionDetector (method="mog2", по умолчанию) или YoloDetector (method="yolo");
+        # оба дают list[Blob] — трекер/счётчики не знают, какой детектор.
+        self.detector = None
         self.tracker: Optional[TrackerAdapter] = None
         self.size_profile: Optional[SizeProfile] = None
         self.counters: list[BaseCounter] = []
@@ -237,7 +239,14 @@ class Pipeline:
               f"effective_fps={self.cfg.processing.effective_fps or 'нативный'}")
 
         self.size_profile = SizeProfile(self.cfg.size_profile, self.cfg.objects, w, h)
-        self.detector = MotionDetector(self.cfg)
+        if self.cfg.processing.method == "yolo":
+            from .yolo_detector import YoloDetector  # лениво: тянет torch
+            y = self.cfg.processing.yolo or {}
+            self.detector = YoloDetector(self.cfg)
+            _emit(f"детектор: YOLO model={y.get('model', 'yolov8n.pt')} "
+                  f"conf={y.get('conf', 0.4)} device={y.get('device', 'cpu')}")
+        else:
+            self.detector = MotionDetector(self.cfg)
         fr = self._effective_frame_rate()
         self.tracker = TrackerAdapter(self.cfg, frame_rate=fr)
         _emit(f"трекер: {self.cfg.tracker.type} @ frame_rate={fr:.1f} "

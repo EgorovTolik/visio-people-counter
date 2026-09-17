@@ -343,14 +343,39 @@ class ProcessingConfig:
     #: (ffmpeg -vf crop / NumPy-срез), поэтому ВСЕ координаты настроек и событий
     #: отсчитываются от ROI.
     roi: Optional[list[float]] = None
+    #: Метод детекции (задача 22): "mog2" — background subtraction (блок motion);
+    #: "yolo" — ultralytics YOLO, только люди (class=0), см. :mod:`yolo_detector`.
+    method: str = "mog2"
+    #: Настройки YOLO-детектора (только при method="yolo"): {model, conf, device}.
+    yolo: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: Any) -> "ProcessingConfig":
         d = _as_dict(d, "processing")
         _check_unknown_keys(
             d, {"effective_fps", "max_width", "frame_start", "frame_end",
-                "time_start", "time_end", "roi"}, "processing"
+                "time_start", "time_end", "roi", "method", "yolo"}, "processing"
         )
+        method = _get_enum(d, "method", "processing", "mog2", {"mog2", "yolo"})
+        yolo: dict = {}
+        raw_yolo = d.get("yolo")
+        if raw_yolo:  # пустой/отсутствующий блок → {} (дефолты применяет YoloDetector)
+            raw_yolo = _as_dict(raw_yolo, "processing.yolo")
+            _check_unknown_keys(raw_yolo, {"model", "conf", "device"}, "processing.yolo")
+            y_model = _get_str(raw_yolo, "model", "processing.yolo", "yolov8n.pt")
+            if not y_model:
+                raise ConfigError(
+                    f"processing.yolo.model: ожидалось непустой str (путь к .pt или название модели), "
+                    f"получено {y_model!r}")
+            y_conf = _get_float(raw_yolo, "conf", "processing.yolo", 0.4)
+            if not (0.0 < y_conf <= 1.0):
+                raise ConfigError(f"processing.yolo.conf: ожидалось число в (0..1], получено {y_conf!r}")
+            y_device = _get_str(raw_yolo, "device", "processing.yolo", "cpu")
+            if not y_device:
+                raise ConfigError(
+                    f"processing.yolo.device: ожидалось непустой str (напр. 'cpu' или 'cuda:0'), "
+                    f"получено {y_device!r}")
+            yolo = {"model": y_model, "conf": y_conf, "device": y_device}
         eff = _get_float(d, "effective_fps", "processing", 0.0)
         if eff < 0:
             raise ConfigError(f"processing.effective_fps: ожидалось >= 0, получено {eff!r}")
@@ -376,7 +401,7 @@ class ProcessingConfig:
                 raise ConfigError(f"processing.time_end: ожидалось >= 0, получено {te!r}")
         roi = _get_roi(d, "roi", "processing")
         return cls(effective_fps=eff, max_width=mw, frame_start=fs, frame_end=fe,
-                   time_start=ts, time_end=te, roi=roi)
+                   time_start=ts, time_end=te, roi=roi, method=method, yolo=yolo)
 
 
 def describe_frame_range(frame_start: Optional[int], frame_end: Optional[int]) -> str:
