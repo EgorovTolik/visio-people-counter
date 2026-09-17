@@ -202,13 +202,13 @@ class GuiOverlay:
         if self.debug.show_bboxes and objects:
             for o in objects:
                 color = (0, 255, 0) if o.track_id != -1 else (0, 165, 255)
-                cv2.rectangle(frame, (o.x, o.y), (o.x + o.w, o.y + o.h), color, 2,
+                cv2.rectangle(frame, (o.x, o.y), (o.x + o.w, o.y + o.h), color, 1,
                               lineType=cv2.LINE_AA)
                 label = f"#{o.track_id}" if o.track_id != -1 else "new"
                 tx = max(0, int(o.x))
                 ty = int(o.y) - 6 if int(o.y) - 6 > 14 else int(o.y) + 18
                 cv2.putText(frame, label, (tx, ty), self.FONT,
-                            max(self.MIN_FONT_SCALE, 0.6), color, 2, cv2.LINE_AA)
+                            0.3, color, 1, cv2.LINE_AA)
 
         # 4) счётчики: линия/зона (line_counter.draw) — всегда; крупные in/out
         #    в углу — только при with_text=True (в Qt-окне текст переносится
