@@ -314,8 +314,15 @@ class Pipeline:
         if events:
             self.event_log.log_events(events)
             for ev in events:
+                # процент обработки: frames_processed / total_frames (если известен)
+                src = self.source
+                pct = ""
+                if src is not None and src.fps and src.duration:
+                    total = int(src.duration * src.fps)
+                    if total > 0:
+                        pct = f" ({self.frames_processed}/{total}, {100.0 * self.frames_processed / total:.0f}%)"
                 _emit(f"СОБЫТИЕ {ev.counter_id} {ev.direction} track={ev.track_id} "
-                      f"@ ({ev.x_px:.0f},{ev.y_px:.0f}) frame={ev.frame_index}")
+                      f"@ ({ev.x_px:.0f},{ev.y_px:.0f}) frame={ev.frame_index}{pct}")
         t3 = time.monotonic()
 
         if self.bench:
