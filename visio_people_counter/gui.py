@@ -399,6 +399,10 @@ class GuiPlayer:
             src = getattr(self.pipeline, 'source', None)
             fps = getattr(src, 'fps', 0) if src else 0
             duration = getattr(src, 'duration', 0) if src else 0
+            # если frame_end задан — показываем ограниченную длительность (time_end)
+            fe = self.cfg.processing.frame_end
+            if fe is not None and fps > 0:
+                duration = min(duration, (fe + 1) / fps) if duration > 0 else (fe + 1) / fps
             if fps and frame_index >= 0:
                 cur_t = frame_index / fps
                 txt += f"   {self._fmt_time(cur_t)}"
