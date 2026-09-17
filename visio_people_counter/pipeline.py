@@ -544,6 +544,12 @@ class Pipeline:
                 if skip > 1 and frame.index % skip != 0:
                     continue
 
+                # ранний выход: frame_end достигнут (end включительно — текущий кадр ещё обработаем)
+                fe = self.cfg.processing.frame_end
+                if fe is not None and frame.index > fe:
+                    reason = f"frame_end={fe}"
+                    break
+
                 self.step(frame)
 
                 now = time.monotonic()
