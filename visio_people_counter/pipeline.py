@@ -314,11 +314,14 @@ class Pipeline:
         if events:
             self.event_log.log_events(events)
             for ev in events:
-                # процент обработки: frames_processed / total_frames (если известен)
+                # процент обработки: frames_processed / total (учитывает frame_end)
                 src = self.source
                 pct = ""
                 if src is not None and src.fps and src.duration:
-                    total = int(src.duration * src.fps)
+                    video_total = int(src.duration * src.fps)
+                    # если frame_end задан — обработка остановится на нём (раньше EOF)
+                    fe = self.cfg.processing.frame_end
+                    total = min(fe + 1, video_total) if fe is not None else video_total
                     if total > 0:
                         pct = f" ({self.frames_processed}/{total}, {100.0 * self.frames_processed / total:.0f}%)"
                 _emit(f"СОБЫТИЕ {ev.counter_id} {ev.direction} track={ev.track_id} "
