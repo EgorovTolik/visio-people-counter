@@ -68,6 +68,10 @@ from .calibrate import (
     undo_last_size_point,
 )
 
+#: максимальная длина одного уведомления на кадре (cv2-окно) — в символах; для Qt
+#: сообщения показываются целиком в статусбаре, здесь только фолбэк-отсечение.
+MESSAGE_TRUNCATE_LEN = 90
+
 
 class CalibrationController:
     """«Мозг» калибровки: источник + кэш кадров + состояние + события (без окна).
@@ -269,7 +273,8 @@ class CalibrationController:
         img = _draw_calibration(self.frames[idx], self.state, self.mask_on,
                                 self.masks[idx], self.w, self.h,
                                 mouse_pos=self._mouse,
-                                active_roi=self.cfg.processing.roi)
+                                active_roi=self.cfg.processing.roi,
+                                with_text=self.frame_ui)   # Qt (frame_ui=False): только графика
         # подпись ROI в статусной строке (текущее значение из конфига)
         roi_label = None
         if self.cfg.processing.roi is not None:
@@ -286,13 +291,16 @@ class CalibrationController:
             panel_y = 72   # сообщения — под строкой кнопок (панель заканчивается ~y=66)
         else:
             self.buttons = []   # Qt: панель не рисуем, клики по ней не ловим
-            panel_y = 10        # уведомления — сразу сверху кадра
-        # живут MESSAGE_TTL_SECONDS секунд
-        self.pending_msgs[:] = filter_expired_messages(self.pending_msgs, time.monotonic())
-        for i, (msg, _exp) in enumerate(self.pending_msgs):
-            draw_notification(img, msg[:90], x=10, y=panel_y + 20 * i, size_px=14)
-        if self.time_input_active:
-            # буфер ввода времени дублируется на экране каждый кадр
+            panel_y = 10        # уведомления — сверху кадра (только для cv2)
+        # живут MESSAGE_TTL_SECONDS секунд; на кадре рисуются ТОЛЬКО в cv2-окне
+        # (frame_ui=True): Qt показывает их в статусбаре — задачи 19.
+        if self.frame_ui:
+            self.pending_msgs[:] = filter_expired_messages(self.pending_msgs, time.monotonic())
+            for i, (msg, _exp) in enumerate(self.pending_msgs):
+                draw_notification(img, msg[:MESSAGE_TRUNCATE_LEN], x=10,
+                                  y=panel_y + 20 * i, size_px=14)
+        if self.frame_ui and self.time_input_active:
+            # буфер ввода времени дублируется на экране каждый кадр (только cv2)
             buf_str = "".join(str(d) for d in self.time_buf.digits) or "_"
             put_text(img, f"Время (сек): {buf_str} | Enter=OK, ESC/q=отмена",
                      (10, 92), size_px=16, color=(0, 255, 255))

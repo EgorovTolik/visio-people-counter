@@ -929,6 +929,80 @@ _HINTS = {
 
 
 
+# ---------------------------------------------------------------------------
+# Чистые функции генерации ТЕКСТА (подсказки/уведомления) — для Qt-виджетов
+# (задача 19: вынос текста из кадра в статусбар/QLabel). Тестируются без окна.
+# ---------------------------------------------------------------------------
+
+#: подсказка о втором клике «мерки роста» (pending): показывается, пока ждём 2-ю точку.
+_PENDING_SIZE_HINT_TEXT = "мерка: кликните 2-ю точку (низ/верх человека)"
+#: подпись режима «ROI» в режиме рисования (показывается под кадром в Qt).
+_ROI_MODE_HINT_TEXT = "ROI: Enter — принять | r — заново | ESC — отмена"
+
+
+def hint_lines(mode: str) -> list[str]:
+    """Подсказки режима на экране (чистая функция): строки :data:`_HINTS[mode]`.
+
+    ``mode`` может быть ``None`` (никакой режим не выбран) — тогда берутся общие
+    подсказки :data:`_HINTS[None]`. Возвращает список строк (разделённых ``\n``).
+    """
+    if mode not in _HINTS:
+        mode = None
+    return _HINTS[mode].split("\n")
+
+
+def size_point_label(point: tuple[float, float, float]) -> str:
+    """Подпись завершённой size-точки «мерка роста» (чистая функция).
+
+    ``point`` — тройка ``(x_frac, y_frac, h_frac)``; подпись = «размер: N%», где
+    N — рост в % высоты кадра (округление до целого). Пример:
+    ``size_point_label((0.3, 0.4, 0.2)) == «размер: 20%»``.
+    """
+    _x_f, _y_f, h_f = float(point[0]), float(point[1]), float(point[2])
+    return f"размер: {int(round(h_f * 100))}%"
+
+
+def pending_size_hint(state: CalibrationState, w: int, h: int,
+                      mouse_pos: Optional[tuple[int, int]] = None) -> Optional[str]:
+    """Подсказка для ОЖИДАЮЩЕЙ «мерки роста» (чистая функция).
+
+    ``state.size_first_point`` задан — ждём второй клик. Если ``mouse_pos`` задан
+    (координаты курсора в ИСХОДНОМ кадре) — приписать текущую длину мерки:
+    «мера: {len}px ({pct}% кадра)»; иначе — только подсказка о втором клике.
+
+    :returns: строку с подписью, или ``None``, если pending-пары нет
+        (``state.size_first_point is None``).
+    """
+    first = getattr(state, "size_first_point", None)
+    if first is None:
+        return None
+    fy = int(round(first[1] * h)) if h > 0 else 0
+    parts = [_PENDING_SIZE_HINT_TEXT]
+    if mouse_pos is not None and h > 0:
+        _mx, my = mouse_pos
+        len_px = abs(my - fy)
+        pct = int(round(len_px / h * 100))
+        parts.insert(0, f"мера: {len_px}px ({pct}% кадра)")
+    return "; ".join(parts)
+
+
+def roi_mode_hint() -> str:
+    """Подсказка режима «ROI» в режиме рисования (чистая функция)."""
+    return _ROI_MODE_HINT_TEXT
+
+
+def line_hint(mode: Optional[str], state: CalibrationState) -> Optional[str]:
+    """Подсказка режима «линия»: сколько точек из двух нарисовано (чистая функция).
+
+    Возвращает «линия: кликните начало (A), затем конец (B); сейчас {n}/2», если
+    ``mode == \"line\"`` и уже нарисована хотя бы одна точка; иначе ``None``.
+    """
+    if mode == "line" and len(state.line_points) > 0:
+        n = len(state.line_points)
+        return f"линия: кликное начало (A), затем конец (B); сейчас {n}/2"
+    return None
+
+
 def _dashed_line(img: np.ndarray, p1: tuple[int, int], p2: tuple[int, int],
                  color, thickness: int = 2,
                  dash_px: int = 8, gap_px: int = 6) -> None:
@@ -953,13 +1027,17 @@ def _dashed_line(img: np.ndarray, p1: tuple[int, int], p2: tuple[int, int],
 def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
                       mask: Optional[np.ndarray], w: int, h: int,
                       mouse_pos: Optional[tuple[int, int]] = None,
-                      active_roi: Optional[list[float]] = None) -> np.ndarray:
+                      active_roi: Optional[list[float]] = None,
+                      *, with_text: bool = True) -> np.ndarray:
     """Отрисовка состояния калибровки на копии кадра (чистая функция).
 
     ``mouse_pos`` — текущая позиция курсора (для live-превью pending «мерки роста»);
     None — превью не рисуется.
     ``active_roi`` — принятый ROI из конфига: кадр уже является ROI-видом,
     поэтому рисуем рамку по краям кадра (подпись — в статусной строке).
+    ``with_text`` — рисовать ли ТЕКСТ (подписи A/B, «размер: N%», «мера: …px (%)",
+    «мерка: кликните…», «ROI: Enter…», подсказки режима внизу). При ``False`` рисуется
+    ТОЛЬКО графика (линии/зоны/точки/рамки) — текст вынесен в Qt-виджеты (задача 19).
     """
     img = base.copy()
     if mask_on and mask is not None:
@@ -973,8 +1051,9 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
         pts = [px(p) for p in state.line_points]
         for i, p in enumerate(pts):
             cv2.circle(img, p, 5, (0, 255, 0), -1)
-            cv2.putText(img, "A" if i == 0 else "B", (p[0] + 8, p[1] + 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            if with_text:   # задача 19: подписи A/B переносятся в Qt-подсказку «линия»
+                cv2.putText(img, "A" if i == 0 else "B", (p[0] + 8, p[1] + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
         if len(pts) == 2:
             cv2.line(img, pts[0], pts[1], (0, 255, 0), 2, lineType=cv2.LINE_AA)
 
@@ -998,8 +1077,9 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
         cv2.line(img, (x, top), (x, bottom), (0, 255, 255), 2)
         for ep in ((x, top), (x, bottom)):
             cv2.circle(img, ep, 3, (0, 255, 255), -1)
-        put_text(img, f"размер: {int(round(h_f * 100))}%", (x + 6, max(4, yc - 8)),
-                 size_px=14, color=(0, 255, 255))
+        if with_text:
+            put_text(img, f"размер: {int(round(h_f * 100))}%", (x + 6, max(4, yc - 8)),
+                     size_px=14, color=(0, 255, 255))
 
     # PENDING «мерка роста»: первый клик запомнен — рисуем маркер + пунктирное
     # превью до текущего курсора с текущей длиной (px / % высоты кадра)
@@ -1008,16 +1088,18 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
         fx = int(round(first[0] * w))
         fy = max(0, min(h - 1, int(round(first[1] * h))))
         cv2.circle(img, (fx, fy), 5, (0, 165, 255), -1)
-        put_text(img, "мерка: кликните 2-ю точку (низ/верх человека)",
-                 (max(4, fx + 8), max(4, fy - 10)), size_px=14, color=(0, 165, 255))
+        if with_text:
+            put_text(img, "мерка: кликните 2-ю точку (низ/верх человека)",
+                     (max(4, fx + 8), max(4, fy - 10)), size_px=14, color=(0, 165, 255))
         if mouse_pos is not None:
             mx, my = mouse_pos
             _dashed_line(img, (fx, fy), (mx, my), (0, 165, 255), thickness=2)
             len_px = abs(my - fy)
             pct = int(round(len_px / h * 100)) if h > 0 else 0
-            put_text(img, f"{len_px}px ({pct}% кадра)",
-                     (max(4, mx + 8), max(4, my - 10)), size_px=14,
-                     color=(0, 165, 255))
+            if with_text:
+                put_text(img, f"{len_px}px ({pct}% кадра)",
+                         (max(4, mx + 8), max(4, my - 10)), size_px=14,
+                         color=(0, 165, 255))
 
     # режим «ROI»: два клика по углам — зелёные маркеры + пунктирная рамка-превью
     roi_pts = getattr(state, "roi_points", [])
@@ -1030,9 +1112,10 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
             rx0, ry0 = min(ax, bx), min(ay, by)
             rx1, ry1 = max(ax, bx), max(ay, by)
             cv2.rectangle(img, (rx0, ry0), (rx1, ry1), (0, 255, 0), 2, lineType=cv2.LINE_AA)
-            put_text(img, "ROI: Enter — принять | r — заново | ESC — отмена",
-                     (max(4, rx0), max(72, min(ry1 + 8, h - 20))),
-                     size_px=14, color=(0, 255, 0))
+            if with_text:
+                put_text(img, "ROI: Enter — принять | r — заново | ESC — отмена",
+                         (max(4, rx0), max(72, min(ry1 + 8, h - 20))),
+                         size_px=14, color=(0, 255, 0))
 
     # принятый ROI: кадр — уже ROI-вид; рамка по краям (внутри 4 px) как напоминание
     if active_roi is not None and state.mode != "roi":
@@ -1040,12 +1123,14 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
         cv2.rectangle(img, (m, m), (w - 1 - m, h - 1 - m), (0, 255, 0), 3,
                       lineType=cv2.LINE_AA)
 
-    # подсказки внизу кадра (верх занят статусной строкой + панелью кнопок)
-    hint_lines = _HINTS[state.mode].split("\n")
-    y = h - 18 - 22 * len(hint_lines)
-    for line in hint_lines:
-        put_text(img, line, (10, max(4, y)), size_px=16, color=(255, 255, 255))
-        y += 22
+    # подсказки внизу кадра (верх занят статусной строкой + панелью кнопок);
+    # при with_text=False текст не рисуется — он в Qt-виджете под кадром (задача 19)
+    if with_text:
+        hint_lines = _HINTS[state.mode].split("\n")
+        y = h - 18 - 22 * len(hint_lines)
+        for line in hint_lines:
+            put_text(img, line, (10, max(4, y)), size_px=16, color=(255, 255, 255))
+            y += 22
     return img
 
 

@@ -9,14 +9,17 @@ ROI, save) не дублируется — Qt-окно только рисует
   :func:`calibrate.unscale_mouse` в координаты исходного кадра;
 * :class:`CalibrateQtWindow` — QMainWindow: QToolBar с 13 кнопками над кадром
   (подписи и имена ``on_button`` — ИМЕННО как у cv2-панели), статусбар
-  («счётчик: … | кадр N | scale=…x | <последнее сообщение>»), QTimer-цикл с
-  интервалом ``1000/fps_источника`` (fps<=0 → 33 мс); тик вынесен в :meth:`tick`
-  (вызывается таймером И вручную в тестах);
+  («счётчик: … | кадр N | scale=…x», последние уведомления — в отдельном постоянном
+  виджете); под кадром QLabel-подсказка (режим/размер/ROI, задачи 19) — весь текст окна
+  фиксированного размера, на видео остаётся только графика; QTimer-цикл с интервалом
+  ``1000/fps_источника`` (fps<=0 → 33 мс); тик вынесен в :meth:`tick` (вызывается таймером
+  и вручную в тестах);
 * :class:`CountQtWindow` — окно подсчёта поверх :class:`~visio_people_counter.gui.GuiPlayer`
   (задача 17): QToolBar «Пауза/+скорость/−скорость/масштаб ↓/масштаб ↑/Выход»
   вызывает ``player.handle_key(...)`` с кодами cv2-клавиш; статусбар —
-  ``player.status_text(...)`` + последнее сообщение; QTimer с интервалом
-  ``1000/(fps*speed)`` (fps<=0 → 33 мс), тик — :meth:`CountQtWindow.tick_once`;
+  ``player.status_text(...)`` + последнее сообщение; под кадром пустой QLabel-подсказка
+  (в count тексте на кадре нет); QTimer с интервалом ``1000/(fps*speed)`` (fps<=0 → 33 мс),
+  тик — :meth:`CountQtWindow.tick_once`;
 * :func:`run_calibration_qt` — зеркальный по смыслу ``run_calibration``;
 * :func:`run_count_qt` — Qt-драйвер ``count --gui --backend qt``.
 
@@ -38,7 +41,7 @@ import numpy as np
 from PySide6.QtCore import QPoint, Qt, QTimer
 # QAction — в QtGui с Qt6 (в QtWidgets только deprecated-алиас)
 from PySide6.QtGui import QAction, QImage, QPixmap
-from PySide6.QtWidgets import QApplication, QMainWindow, QToolBar, QWidget
+from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QToolBar, QWidget
 
 import cv2   # BGR→RGB для canvas; обязательная зависимость проекта (не Qt-специфична)
 
@@ -64,8 +67,11 @@ def _sanitize_env_for_pyside() -> None:
 
 from .pipeline import Pipeline   # для аннотации run_count_qt
 
-from .calibrate import (DEFAULT_CACHE_FRAMES, load_calibration_config,
-                        resolve_save_target, unscale_mouse)
+from .calibrate import (DEFAULT_CACHE_FRAMES, counter_status_text, hint_lines,
+                        line_hint, load_calibration_config, pending_size_hint,
+                        roi_mode_hint, resolve_save_target, size_point_label,
+                        unscale_mouse)
+from .config import describe_roi
 from .gui import GuiPlayer
 
 
@@ -239,11 +245,24 @@ class CalibrateQtWindow(QMainWindow):
         # QToolBar и статусбар; отключаем её отображение и hit-test кликов.
         ctrl.frame_ui = False
 
-        # центральный виджет — canvas; мышь → координаты исходного кадра → ctrl
+        # центральный виджет: canvas + подпись-подсказки под ним (задача 19). Canvas
+        # остаётся единственным получателем мыши; текст живёт в QLabel фиксированного
+        # размера, а не на кадре — поэтому при зуме окно/текст не масштабируются.
         self.canvas = VideoCanvas(ctrl, self)
         self.canvas.on_click = ctrl.on_click
         self.canvas.on_mouse_move = ctrl.on_mouse_move
-        self.setCentralWidget(self.canvas)
+        central = QWidget(self)
+        from PySide6.QtWidgets import QVBoxLayout
+        _layout = QVBoxLayout(central)
+        _layout.setContentsMargins(0, 0, 0, 0)
+        _layout.addWidget(self.canvas)
+        # подсказки/уведомления — под кадром, фиксированной высоты (задача 19)
+        self.hint_label = QLabel(self)
+        self.hint_label.setWordWrap(True)
+        self.hint_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.hint_label.setFixedHeight(48)
+        _layout.addWidget(self.hint_label)
+        self.setCentralWidget(central)
 
         # верхняя панель: QToolBar с кнопками (подписи/имена — как у cv2-панели)
         toolbar = QToolBar("Калибровка", self)
@@ -259,7 +278,10 @@ class CalibrateQtWindow(QMainWindow):
             toolbar.addAction(act)
             self.actions[name] = act
 
-        # статусбар: «счётчик: <id> | кадр N | scale=…x | <последнее сообщение>»
+        # статусбар: главная строка (счётчик/кадр/scale/ROI) + постоянный виджет
+        # с активными уведомлениями (задача 19 — текст окна вне кадра).
+        self._msg_widget = QLabel(self)
+        self.statusBar().addPermanentWidget(self._msg_widget)
         self.statusBar().showMessage(self._status_text())
 
         # цикл по таймеру: реалтайм fps источника (как cv2-драйвер); fps<=0 → 33 мс
@@ -294,7 +316,13 @@ class CalibrateQtWindow(QMainWindow):
         self._refresh_ui()
 
     def _refresh_ui(self) -> None:
-        """Синхронизировать подсветку кнопок и статусбар с состоянием контроллера."""
+        """Синхронизировать подсветку кнопок, статусбар и подсказки с состоянием.
+
+        Обновляется каждый тик: кнопки (подсветка режимов), статусбар (главная строка
+        + активные уведомления в постоянном виджете) и :attr:`hint_label` (подсказки
+        режима/размера/ROI под кадром). При ``frame_ui=True`` (режим cv2-окна, текст на
+        кадре) подсказки под кадром НЕ показываются — задачи 19.
+        """
         c = self.ctrl
         active = {
             "line": c.state.mode == "line",
@@ -310,15 +338,49 @@ class CalibrateQtWindow(QMainWindow):
                 act.setChecked(active[name])
                 act.blockSignals(False)
         self.statusBar().showMessage(self._status_text())
+        msgs = c.messages
+        self._msg_widget.setText(", ".join(msgs) if msgs else "")
+        if c.frame_ui:
+            # текст на кадре (cv2-режим): подсказки под кадром пустые
+            self.hint_label.setText("")
+        else:
+            self.hint_label.setText(self._hint_text())
 
     def _status_text(self) -> str:
+        """Главная строка статусбара: ``counter_status_text`` + подпись ROI, если он задан.
+
+        Активные уведомления показываются в отдельном постоянном виджете
+        (:attr:`_msg_widget`), а не в этой строке — задачи 19.
+        """
         c = self.ctrl
-        txt = (f"счётчик: {c.state.counter_id} | кадр {c.frame_index} "
-               f"| scale={c.scale:g}x")
-        msgs = c.messages   # активные уведомления БЕЗ отрисовки (TTL 5 c)
-        if msgs:
-            txt += f" | {msgs[-1]}"
+        txt = counter_status_text(c.state.counter_id, c.cfg.counters,
+                                  scale=c.scale,
+                                  frame_index=(c.frame_indices[c._idx]
+                                               if c._idx < len(c.frame_indices) else None))
+        roi = getattr(c.cfg.processing, "roi", None)
+        if roi is not None:
+            txt += f"   ROI: {describe_roi(roi)}"
         return txt
+
+    def _hint_text(self) -> str:
+        """Подсказки под кадром (Qt): режим + line_hint, завершённые мерки,
+        pending-мерка, подсказка режима ROI — всё через чистые функции calibrate.
+        Строки соединяются ``" | "``; пустая строка, если нечего показывать."""
+        c = self.ctrl
+        state = c.state
+        parts: list[str] = []
+        parts.extend(hint_lines(state.mode))
+        lh = line_hint(state.mode, state)
+        if lh:
+            parts.append(lh)
+        for p in state.size_points:
+            parts.append(size_point_label(p))
+        ph = pending_size_hint(state, c.width, c.height, c._mouse)
+        if ph:
+            parts.append(ph)
+        if state.mode == "roi":
+            parts.append(roi_mode_hint())
+        return " | ".join(parts)
 
     def closeWindow(self) -> None:
         """Закрыть окно (closeEvent закроет источник контроллера)."""
@@ -403,10 +465,21 @@ class CountQtWindow(QMainWindow):
         self._closed = False   # QWidget.isClosed() нет — состояние ведём сами (closeEvent)
         self.setWindowTitle(player.window_name)
 
-        # центральный виджет — тот же VideoCanvas; только отображение, мышь не нужна
+        # центральный виджет: тот же VideoCanvas (только отображение) + пустая
+        # подсказка под кадром для единообразия с calibrate-окном (задача 19); в count
+        # тексте на кадре нет, поэтому hint_label остаётся пустым.
         self.canvas_state = _CountCanvasState()
         self.canvas = VideoCanvas(self.canvas_state, self)
-        self.setCentralWidget(self.canvas)
+        central = QWidget(self)
+        from PySide6.QtWidgets import QVBoxLayout
+        _layout = QVBoxLayout(central)
+        _layout.setContentsMargins(0, 0, 0, 0)
+        _layout.addWidget(self.canvas)
+        self.hint_label = QLabel(self)
+        self.hint_label.setWordWrap(True)
+        self.hint_label.setFixedHeight(32)
+        _layout.addWidget(self.hint_label)
+        self.setCentralWidget(central)
 
         # верхняя панель: QToolBar с кнопками (коды — как клавиши cv2-окна)
         toolbar = QToolBar("Подсчёт", self)
@@ -460,6 +533,7 @@ class CountQtWindow(QMainWindow):
         st.width, st.height, st.scale = w, h, 1.0   # кадр уже отмасштабирован player'ом
         self.canvas.show_frame(view)
         self._refresh_ui()
+        self.hint_label.setText("")   # count: текст на кадре отсутствует — подсказка пуста
 
     def _refresh_ui(self) -> None:
         """Синхронизировать подсветку «Пауза», интервал таймера и статусбар."""
