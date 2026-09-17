@@ -137,9 +137,11 @@ class Pipeline:
     вызывает его сам, если ещё не вызван.
     """
 
-    def __init__(self, config: "Union[str, Path, Config]", bench: bool = False) -> None:
+    def __init__(self, config: "Union[str, Path, Config]", bench: bool = False,
+                 save_events: bool = False) -> None:
         self.cfg: Config = Config.load(config) if isinstance(config, (str, Path)) else config
         self.bench = bool(bench)
+        self.save_events = bool(save_events)
 
         # --- компоненты (заполняются в build()) ---------------------------------
         self.source: Optional[VideoSource] = None
@@ -399,7 +401,9 @@ class Pipeline:
             reason=reason,
         )
         try:
-            write_report(path, build_report(self.cfg, self.report_events, meta))
+            write_report(path, build_report(
+                self.cfg, self.report_events, meta,
+                save_events=self.save_events))
         except OSError as e:
             print(f"[pipeline] отчёт {path}: не удалось сохранить: {e}",
                   file=sys.stderr, flush=True)

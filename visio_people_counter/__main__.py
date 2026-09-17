@@ -105,7 +105,7 @@ def cmd_count(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        pipe = Pipeline(cfg, bench=args.bench)
+        pipe = Pipeline(cfg, bench=args.bench, save_events=args.save_events)
         if args.gui:
             # проверка доступности GUI — для обоих бэкендов (нет DISPLAY/WAYLAND)
             from .gui import GuiPlayer
@@ -298,6 +298,9 @@ def build_parser() -> argparse.ArgumentParser:
                          metavar="{qt,cv2}",
                          help="окно подсчёта (--gui): Qt (PySide6) или cv2; по умолчанию qt, "
                               "если установлен PySide6, иначе cv2 с предупреждением")
+    p_count.add_argument("--save-events", action="store_true",
+                         help="записать таблицу событий в отчёт *.report.md "
+                              "(по умолчанию — только итоги по счётчикам)")
     p_count.set_defaults(func=cmd_count)
 
     p_cal = sub.add_parser(

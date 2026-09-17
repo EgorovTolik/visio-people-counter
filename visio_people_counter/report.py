@@ -63,12 +63,15 @@ def _fmt_num(x: float) -> str:
     return f"{x:g}"
 
 
-def build_report(cfg: Config, events: Sequence[CrossingEvent], meta: RunMeta) -> str:
+def build_report(cfg: Config, events: Sequence[CrossingEvent], meta: RunMeta,
+                 *, save_events: bool = False) -> str:
     """Собрать markdown-отчёт прогона.
 
     :param cfg: конфиг (список счётчиков — разрез «Итогов» по каждому из них).
     :param events: ВСЕ события прогона (в порядке их возникновения).
     :param meta: мета-данные прогона (кадры, fps, длительность, reason).
+    :param save_events: True — записать разделы «События: …» с таблицей каждого
+        пересечения; False (по умолчанию) — только итоги по счётчикам.
     """
     lines: list[str] = []
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -117,24 +120,25 @@ def build_report(cfg: Config, events: Sequence[CrossingEvent], meta: RunMeta) ->
     )
     lines.append("")
 
-    # --- события per-counter ----------------------------------------------------
-    for counter in cfg.counters:
-        evs = [ev for ev in events if ev.counter_id == counter.id]
-        lines.append(f"## События: {counter.id} ({len(evs)})")
-        lines.append("")
-        if not evs:
-            lines.append("(нет)")
+    # --- события per-counter (только при save_events=True) --------------------
+    if save_events:
+        for counter in cfg.counters:
+            evs = [ev for ev in events if ev.counter_id == counter.id]
+            lines.append(f"## События: {counter.id} ({len(evs)})")
             lines.append("")
-            continue
-        lines.append("| # | время (с) | направление | track_id | x_px | y_px | кадр |")
-        lines.append("|---|---|---|---|---|---|---|")
-        for i, ev in enumerate(evs, start=1):
-            t = f"{ev.t_video:.3f}" if ev.t_video is not None else "н/д"
-            lines.append(
-                f"| {i} | {t} | {ev.direction} | {ev.track_id} "
-                f"| {_fmt_num(ev.x_px)} | {_fmt_num(ev.y_px)} | {ev.frame_index} |"
-            )
-        lines.append("")
+            if not evs:
+                lines.append("(нет)")
+                lines.append("")
+                continue
+            lines.append("| # | время (с) | направление | track_id | x_px | y_px | кадр |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for i, ev in enumerate(evs, start=1):
+                t = f"{ev.t_video:.3f}" if ev.t_video is not None else "н/д"
+                lines.append(
+                    f"| {i} | {t} | {ev.direction} | {ev.track_id} "
+                    f"| {_fmt_num(ev.x_px)} | {_fmt_num(ev.y_px)} | {ev.frame_index} |"
+                )
+            lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
 

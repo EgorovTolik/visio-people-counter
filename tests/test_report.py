@@ -53,7 +53,7 @@ class TestBuildReport(unittest.TestCase):
             [_ev("zone_1", "in", 20 + i) for i in range(4)] +
             [_ev("zone_1", "out", 30)]
         )
-        text = build_report(_make_cfg(), events, META)
+        text = build_report(_make_cfg(), events, META, save_events=True)
 
         self.assertIn("# Отчёт подсчёта: demo.mp4", text)
         self.assertIn("## Итоги по счётчикам", text)
@@ -78,7 +78,7 @@ class TestBuildReport(unittest.TestCase):
                  "polygon": [[0.1, 0.1], [0.9, 0.1], [0.9, 0.9]]},
             ],
         }, "<test>")
-        text = build_report(cfg, [_ev("line_2", "in", 1)], META)
+        text = build_report(cfg, [_ev("line_2", "in", 1)], META, save_events=True)
 
         self.assertIn("| zone_empty | zone | 0 | 0 | 0 |", text)
         self.assertIn("## События: zone_empty (0)", text)
@@ -87,7 +87,8 @@ class TestBuildReport(unittest.TestCase):
         self.assertIn("(нет)", zone_section)
 
     def test_missing_t_video_shown(self):
-        text = build_report(_make_cfg(), [_ev("line_2", "out", 5, t_video=None)], META)
+        text = build_report(_make_cfg(), [_ev("line_2", "out", 5, t_video=None)], META,
+                            save_events=True)
         self.assertIn("| н/д | out | 5 |", text)
 
 
