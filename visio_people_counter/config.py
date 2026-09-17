@@ -680,6 +680,7 @@ class Config:
     counters: list[CounterConfig] = field(default_factory=list)
     output: OutputConfig = field(default_factory=OutputConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    config_path: str = ""  # путь к yaml из которого загружен (не сериализуется)
 
     # --- загрузка -----------------------------------------------------------
 
@@ -697,7 +698,9 @@ class Config:
             raw = yaml.safe_load(p.read_text(encoding="utf-8"))
         except yaml.YAMLError as e:
             raise ConfigError(f"{p}: битый YAML: {e}") from e
-        return cls.from_dict(raw if isinstance(raw, dict) else {}, str(p))
+        cfg = cls.from_dict(raw if isinstance(raw, dict) else {}, str(p))
+        cfg.config_path = str(p)
+        return cfg
 
     @classmethod
     def default(cls) -> "Config":
@@ -768,7 +771,9 @@ class Config:
 
     def to_dict(self) -> dict:
         """Обратная сериализация в plain-данные (dataclass → dict)."""
-        return asdict(self)
+        d = asdict(self)
+        d.pop("config_path", None)  # служебное поле, не сериализуется
+        return d
 
     @staticmethod
     def save(cfg: "Config", path: str | Path) -> None:

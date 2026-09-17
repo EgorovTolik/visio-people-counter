@@ -47,6 +47,12 @@ def choose_report_path(cfg: Config) -> Optional[Path]:
     explicit = cfg.output.report_path
     if explicit:
         return Path(explicit).expanduser()
+    # приоритет: имя конфига (если задан config_path)
+    if cfg.config_path:
+        base = Path(cfg.config_path).expanduser()
+        stem = base.stem  # без .yaml/.yml
+        return base.with_name(stem + ".report.md")
+    # fallback: имя видео (для вживую / default-конфига)
     v = cfg.video
     if v.type == "file" and v.path and not is_url(v.path):
         base = Path(v.path).expanduser()
