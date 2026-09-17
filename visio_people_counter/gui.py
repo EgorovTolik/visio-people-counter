@@ -381,12 +381,29 @@ class GuiPlayer:
                                  max(1, int(round(h * self.scale)))),
                           interpolation=interp)
 
+    @staticmethod
+    def _fmt_time(seconds: float) -> str:
+        """Формат hh:mm:ss из секунд."""
+        s = max(0, int(seconds))
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+
     def _status_text(self, proc_fps: float, frame_index: int | None = None) -> str:
         txt = (f"speed={self.speed:.2f}x  proc={proc_fps:.0f}fps  "
                f"scale={self.scale:g}x")
         if self._paused:
             txt += "   [ПАУЗА]"
         if frame_index is not None:
+            # время/продолжительность: hh:mm:ss
+            src = getattr(self.pipeline, 'source', None)
+            fps = getattr(src, 'fps', 0) if src else 0
+            duration = getattr(src, 'duration', 0) if src else 0
+            if fps and frame_index >= 0:
+                cur_t = frame_index / fps
+                txt += f"   {self._fmt_time(cur_t)}"
+                if duration > 0:
+                    txt += f"/{self._fmt_time(duration)}"
             # статус подсчёта в интервале кадров (processing.frame_start/frame_end)
             extra = counting_status_text(
                 frame_index, self.cfg.processing.frame_start, self.cfg.processing.frame_end)
