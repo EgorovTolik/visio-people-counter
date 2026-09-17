@@ -231,6 +231,8 @@ class Pipeline:
         if roi is not None:
             _emit(f"ROI применён: {describe_roi(roi)} (кроп на уровне источника; "
                   f"координаты конфига и событий — в системе ROI)")
+        # time_start/time_end → frame_start/frame_end (приоритет над явными frame_*)
+        self._apply_time_bounds()
         _emit(f"источник: {v.type} {v.path!r} → {w}x{h}, fps источника={self.source.fps or 'н/д'}, "
               f"effective_fps={self.cfg.processing.effective_fps or 'нативный'}")
 
@@ -246,6 +248,23 @@ class Pipeline:
             _emit(f"счётчик: id={c.counter_id} type={ctype} count_mode={c.count_mode}")
         self.event_log = EventLog(self.cfg)
         return self
+
+    def _apply_time_bounds(self) -> None:
+        """Пересчитать frame_start/frame_end из time_start/time_end (сек → кадры).
+
+        Приоритет: если time_start задан — frame_start = int(time_start * fps);
+        аналогично time_end → frame_end. Старые frame_* без time_* не трогаются.
+        """
+        p = self.cfg.processing
+        fps = self.source.fps if self.source else 0
+        if not fps:
+            return   # fps неизвестен — не можем конвертировать
+        if p.time_start is not None:
+            p.frame_start = int(p.time_start * fps)
+            _emit(f"time_start={p.time_start:g}s → frame_start={p.frame_start} (fps={fps:g})")
+        if p.time_end is not None:
+            p.frame_end = int(p.time_end * fps)
+            _emit(f"time_end={p.time_end:g}s → frame_end={p.frame_end} (fps={fps:g})")
 
     def close(self) -> None:
         """Освободить ресурсы (идемпотентно)."""

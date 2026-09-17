@@ -334,6 +334,10 @@ class ProcessingConfig:
     max_width: int = 0                   # даунскейл до ширины; 0 = как в источнике
     frame_start: Optional[int] = None    # первый кадр подсчёта (0-based, включительно); null = без границы
     frame_end: Optional[int] = None      # последний кадр подсчёта (0-based, включительно); null = до конца
+    #: время в секундах (приоритет над frame_start/frame_end): если time_start задан,
+    #: frame_start рассчитывается как int(time_start * fps) после открытия источника.
+    time_start: Optional[float] = None   # начало обработки (сек); null = без границы
+    time_end: Optional[float] = None     # окончание обработки (сек, включительно); null = до конца
     #: ROI — один глобальный прямоугольник [x, y, w, h] в долях ПОЛНОГО кадра;
     #: None/отсутствует = весь кадр. Кроп применяется на уровне источника
     #: (ffmpeg -vf crop / NumPy-срез), поэтому ВСЕ координаты настроек и событий
@@ -344,7 +348,8 @@ class ProcessingConfig:
     def from_dict(cls, d: Any) -> "ProcessingConfig":
         d = _as_dict(d, "processing")
         _check_unknown_keys(
-            d, {"effective_fps", "max_width", "frame_start", "frame_end", "roi"}, "processing"
+            d, {"effective_fps", "max_width", "frame_start", "frame_end",
+                "time_start", "time_end", "roi"}, "processing"
         )
         eff = _get_float(d, "effective_fps", "processing", 0.0)
         if eff < 0:
@@ -359,8 +364,19 @@ class ProcessingConfig:
                 f"processing.frame_start={fs} > processing.frame_end={fe}: "
                 f"ожидалось frame_start <= frame_end (номера кадров 0-based, обе границы включительно)"
             )
+        ts = d.get("time_start")
+        if ts is not None:
+            ts = float(ts)
+            if ts < 0:
+                raise ConfigError(f"processing.time_start: ожидалось >= 0, получено {ts!r}")
+        te = d.get("time_end")
+        if te is not None:
+            te = float(te)
+            if te < 0:
+                raise ConfigError(f"processing.time_end: ожидалось >= 0, получено {te!r}")
         roi = _get_roi(d, "roi", "processing")
-        return cls(effective_fps=eff, max_width=mw, frame_start=fs, frame_end=fe, roi=roi)
+        return cls(effective_fps=eff, max_width=mw, frame_start=fs, frame_end=fe,
+                   time_start=ts, time_end=te, roi=roi)
 
 
 def describe_frame_range(frame_start: Optional[int], frame_end: Optional[int]) -> str:
