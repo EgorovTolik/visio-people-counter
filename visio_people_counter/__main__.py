@@ -62,13 +62,13 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
 
 def _speed_value(s: str) -> float:
-    """CLI-тип --speed: float в диапазоне 0.25..8."""
+    """CLI-тип --speed: положительное число (без верхнего ограничения)."""
     try:
         v = float(s)
     except ValueError:
         raise argparse.ArgumentTypeError(f"--speed: ожидалось число, получено {s!r}")
-    if not (0.25 <= v <= 8.0):
-        raise argparse.ArgumentTypeError("--speed: ожидалось 0.25..8, получено " + repr(v))
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"--speed: ожидалось > 0, получено {v!r}")
     return v
 
 
