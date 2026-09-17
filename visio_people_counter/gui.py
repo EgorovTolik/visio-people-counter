@@ -428,6 +428,14 @@ class GuiPlayer:
             # задача 14: маленький кадр → авто-увеличение масштаба отображения
             # (идемпотентно/монотонно — run() применяет тот же вызов перед циклом)
             self.scale = auto_ui_scale(pipe.source.width, pipe.source.height, self.scale)
+            # GUI: seek к time_start/frame_start — просмотр начинается с нужного места
+            fs = self.cfg.processing.frame_start
+            if fs and fs > 0:
+                fps_val = pipe.source.fps or 0
+                if fps_val > 0:
+                    t_seek = fs / fps_val
+                    if pipe.source.seek(t_seek):
+                        _emit(f"GUI: перемотка к {t_seek:.1f}s (frame_start={fs})")
             # thread-pipeline: запускаем reader-поток после build() (один раз)
             if self.use_threads and self._frame_queue is None:
                 self._start_reader()
