@@ -79,9 +79,11 @@ processing:
 
   # Настройки YOLO-детектора — только при method: yolo:
   yolo:
-    model: yolov8n.pt         # путь к .pt-файлу или название (ultralytics скачает сам)
+    backend: torch            # "torch" — ultralytics (тянет torch) | "onnx" — ONNX Runtime
+                              # (onnxruntime; без torch — для старых GPU, напр. Pascal)
+    model: yolov8n.pt         # путь к .pt (backend=torch) или .onnx (backend=onnx)
     conf: 0.4                 # порог уверенности (0..1); bbox с conf ниже отбрасывается
-    device: cpu               # "cpu" | "cuda:0"
+    device: cpu               # "cpu" | "cuda:0" (для onnx: CUDAExecutionProvider + fallback CPU)
 
 motion:
   # ---------------------------------------------------------------------------

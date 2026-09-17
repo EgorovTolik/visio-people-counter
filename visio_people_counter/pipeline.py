@@ -240,11 +240,19 @@ class Pipeline:
 
         self.size_profile = SizeProfile(self.cfg.size_profile, self.cfg.objects, w, h)
         if self.cfg.processing.method == "yolo":
-            from .yolo_detector import YoloDetector  # лениво: тянет torch
             y = self.cfg.processing.yolo or {}
-            self.detector = YoloDetector(self.cfg)
-            _emit(f"детектор: YOLO model={y.get('model', 'yolov8n.pt')} "
-                  f"conf={y.get('conf', 0.4)} device={y.get('device', 'cpu')}")
+            backend = y.get("backend", "torch")
+            if backend == "onnx":  # лениво: тянет onnxruntime (без torch)
+                from .yolo_onnx import YoloOnnxDetector
+                self.detector = YoloOnnxDetector(self.cfg)
+                _emit(f"детектор: YOLO(ONNX) model={y.get('model') or 'yolov8n.onnx'} "
+                      f"conf={y.get('conf', 0.4)} device={y.get('device', 'cpu')} "
+                      f"providers={self.detector.providers}")
+            else:  # лениво: тянет torch
+                from .yolo_detector import YoloDetector
+                self.detector = YoloDetector(self.cfg)
+                _emit(f"детектор: YOLO model={y.get('model', 'yolov8n.pt')} "
+                      f"conf={y.get('conf', 0.4)} device={y.get('device', 'cpu')}")
         else:
             self.detector = MotionDetector(self.cfg)
         fr = self._effective_frame_rate()

@@ -92,7 +92,8 @@ class TestConfigYolo(unittest.TestCase):
         # непустой блок yolo → отсутствующие ключи добираются дефолтами
         p = ProcessingConfig.from_dict({"method": "yolo", "yolo": {"conf": 0.5}})
         self.assertEqual(p.method, "yolo")
-        self.assertEqual(p.yolo, {"model": "yolov8n.pt", "conf": 0.5, "device": "cpu"})
+        self.assertEqual(p.yolo, {"model": "yolov8n.pt", "conf": 0.5, "device": "cpu",
+                                  "backend": "torch"})
 
     def test_yolo_block_absent_or_empty_stays_empty_dict(self):
         # блок yolo не задан или пустой → {} (YoloDetector сам применяет дефолты)
@@ -130,7 +131,9 @@ class TestConfigYolo(unittest.TestCase):
     def test_full_config_roundtrip(self):
         cfg = Config.from_dict(_cfg_dict(yolo={"conf": 0.5}))
         self.assertEqual(cfg.processing.method, "yolo")
-        self.assertEqual(cfg.processing.yolo, {"model": "yolov8n.pt", "conf": 0.5, "device": "cpu"})
+        self.assertEqual(cfg.processing.yolo,
+                         {"model": "yolov8n.pt", "conf": 0.5, "device": "cpu",
+                          "backend": "torch"})
 
 
 # ---------------------------------------------------------------------------

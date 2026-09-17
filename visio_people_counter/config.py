@@ -346,7 +346,8 @@ class ProcessingConfig:
     #: Метод детекции (задача 22): "mog2" — background subtraction (блок motion);
     #: "yolo" — ultralytics YOLO, только люди (class=0), см. :mod:`yolo_detector`.
     method: str = "mog2"
-    #: Настройки YOLO-детектора (только при method="yolo"): {model, conf, device}.
+    #: Настройки YOLO-детектора (только при method="yolo"): {model, conf, device, backend};
+    #: backend: "torch" (ultralytics, дефолт) | "onnx" (ONNX Runtime, см. :mod:`yolo_onnx`).
     yolo: dict = field(default_factory=dict)
 
     @classmethod
@@ -361,7 +362,8 @@ class ProcessingConfig:
         raw_yolo = d.get("yolo")
         if raw_yolo:  # пустой/отсутствующий блок → {} (дефолты применяет YoloDetector)
             raw_yolo = _as_dict(raw_yolo, "processing.yolo")
-            _check_unknown_keys(raw_yolo, {"model", "conf", "device"}, "processing.yolo")
+            _check_unknown_keys(raw_yolo, {"model", "conf", "device", "backend"},
+                                "processing.yolo")
             y_model = _get_str(raw_yolo, "model", "processing.yolo", "yolov8n.pt")
             if not y_model:
                 raise ConfigError(
@@ -375,7 +377,11 @@ class ProcessingConfig:
                 raise ConfigError(
                     f"processing.yolo.device: ожидалось непустой str (напр. 'cpu' или 'cuda:0'), "
                     f"получено {y_device!r}")
-            yolo = {"model": y_model, "conf": y_conf, "device": y_device}
+            y_backend = _get_str(raw_yolo, "backend", "processing.yolo", "torch")
+            if y_backend not in {"torch", "onnx"}:
+                raise ConfigError(
+                    f"processing.yolo.backend: ожидалось 'torch' или 'onnx', получено {y_backend!r}")
+            yolo = {"model": y_model, "conf": y_conf, "device": y_device, "backend": y_backend}
         eff = _get_float(d, "effective_fps", "processing", 0.0)
         if eff < 0:
             raise ConfigError(f"processing.effective_fps: ожидалось >= 0, получено {eff!r}")
