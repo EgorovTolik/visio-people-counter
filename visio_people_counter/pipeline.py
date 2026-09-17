@@ -323,7 +323,7 @@ class Pipeline:
                     fe = self.cfg.processing.frame_end
                     total = min(fe + 1, video_total) if fe is not None else video_total
                     if total > 0:
-                        pct = f" ({self.frames_processed}/{total}, {100.0 * self.frames_processed / total:.0f}%)"
+                        pct = f" ({self.frames_processed}/{total}, {100.0 * self.frames_processed / total:.2f}%)"
                 _emit(f"СОБЫТИЕ {ev.counter_id} {ev.direction} track={ev.track_id} "
                       f"@ ({ev.x_px:.0f},{ev.y_px:.0f}) frame={ev.frame_index}{pct}")
         t3 = time.monotonic()
