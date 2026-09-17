@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .config import Config, describe_frame_range
+from .config import Config, describe_frame_range, describe_roi
 from .line_counter import CrossingEvent
 from .video_source import is_url
 
@@ -85,6 +85,14 @@ def build_report(cfg: Config, events: Sequence[CrossingEvent], meta: RunMeta) ->
         f"- интервал кадров: "
         f"{describe_frame_range(cfg.processing.frame_start, cfg.processing.frame_end)}"
     )
+    # ROI (processing.roi): кроп на уровне источника; None/отсутствует → «нет»
+    roi = cfg.processing.roi
+    lines.append(f"- ROI: {describe_roi(roi)}")
+    if roi is not None:
+        lines.append(
+            "- примечание: координаты конфига (линии/зоны/size-точки) и событий "
+            "(x_px/y_px, events.jsonl) — в системе ROI, т.е. отсчитываются от кропа"
+        )
     lines.append("")
 
     # --- итоги per-counter (по счётчикам из конфига; 0 событий → нули) ----------

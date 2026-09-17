@@ -19,6 +19,7 @@ Headless-фолбэк: :meth:`GuiPlayer.available` — чистая провер
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import time
@@ -37,6 +38,35 @@ from .video_source import FfmpegPipeSource
 #: допустимый диапазон скорости воспроизведения (CLI --speed и клавиши +/-).
 MIN_SPEED = 0.25
 MAX_SPEED = 8.0
+
+#: задача 14 — авто-масштаб окна при маленьком кадре (маленький ROI):
+#: минимальный «размер окна» для доступного UI (панель кнопок + статусная строка)
+MIN_UI_W, MIN_UI_H = 640, 320
+#: потолок авто-увеличения
+MAX_AUTO_SCALE = 25.0
+
+
+def auto_ui_scale(src_w: int, src_h: int, user_scale: float) -> float:
+    """Масштаб ОТОБРАЖЕНИЯ: максимум(user_scale, того что вписывает кадр в MIN_UI_*).
+
+    Задача 14: при маленьком кадре (маленький ROI) автоматически поднять масштаб
+    отображения так, чтобы окно было ≥ ~640×320 и UI оставался доступным.
+
+    - кадр уже больше минимумов по обеим осям → user_scale без изменений;
+    - иначе required = max(MIN_UI_W/src_w, MIN_UI_H/src_h), округлённый ВВЕРХ
+      до 0.1, но не выше MAX_AUTO_SCALE и не ниже user_scale
+      (пользовательское --scale — минимум).
+
+    :param src_w: ширина кадра в px (ROI-размер после кропа); <= 0 → user_scale.
+    :param src_h: высота кадра в px; <= 0 → user_scale.
+    :param user_scale: пользовательский масштаб (--scale / initial_scale).
+    :returns: масштаб отображения в диапазоне [user_scale, MAX_AUTO_SCALE].
+    """
+    if src_w <= 0 or src_h <= 0:
+        return float(user_scale)
+    needed = max(MIN_UI_W / float(src_w), MIN_UI_H / float(src_h))
+    rounded = math.ceil(needed * 10.0 - 1e-9) / 10.0   # вверх до 0.1 (без FP-шума)
+    return min(MAX_AUTO_SCALE, max(float(user_scale), rounded))
 
 
 #: системная папка плагинов Qt5 (там живёт platformtheme gtk3/gtk2)
@@ -61,8 +91,9 @@ def apply_qt_env() -> None:
     os.environ.setdefault("QT_QPA_PLATFORMTHEME", "gtk3")
 
 
-# до первого cv2.imshow/namedWindow (создание QApplication) — на момент импорта модуля
-apply_qt_env()
+# ВАЖНО: вызывается НЕ при импорте, а лениво в cv2-драйверах (GuiPlayer.run,
+# calibrate.run_calibration) — иначе QT_PLUGIN_PATH/QT_QPA_PLATFORMTHEME попали бы
+# в процесс и сломали PySide6-бэкенд (см. gui_qt._sanitize_env_for_pyside).
 
 
 def clamp_speed(speed: float) -> float:
@@ -93,6 +124,24 @@ def _emit(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# counters_status_line — чистая строка счётчиков для Qt-статусбара (задача 20)
+# ---------------------------------------------------------------------------
+
+def counters_status_line(counters: list[BaseCounter]) -> str:
+    """Сводка счётчиков в одну строку для Qt-статусбара.
+
+    Формат: «счётчики: <id>: in=N out=M | <id2>: in=N out=M» (для ``total``-
+    режимов — «<id>: total=N»). Строки счётчиков соединяются ``" | "``;
+    пустая строка, если counters нет. Значения берутся актуальные на момент
+    вызова (``BaseCounter.label_text()`` + текущие in/out/total). Не рисует —
+    только чистая строка для статусбара.
+    """
+    if not counters:
+        return ""
+    return "счётчики: " + " | ".join(c.label_text() for c in counters)
+
+
+# ---------------------------------------------------------------------------
 # Overlay (чистая отрисовка — без imshow)
 # ---------------------------------------------------------------------------
 
@@ -115,7 +164,8 @@ class GuiOverlay:
              blobs: list[Blob] | None = None,
              mask: np.ndarray | None = None,
              counters: list[BaseCounter] | None = None,
-             status_text: str = "") -> np.ndarray:
+             status_text: str = "",
+             with_text: bool = True) -> np.ndarray:
         """Нарисовать overlay на BGR-кадр (in-place) и вернуть его.
 
         :param frame: кадр (h, w, 3) uint8 — модифицируется на месте.
@@ -124,7 +174,11 @@ class GuiOverlay:
         :param mask: маска движения 0/255 того же размера (``show_mask`` → микс 50/50).
         :param counters: счётчики (``show_counters``): линия/зона через
             ``counter.draw`` + крупные текущие in/out в левом верхнем углу.
-        :param status_text: строка статуса справа сверху (скорость, PAUSED...).
+        :param status_text: строка статуса справа сверху (скорость, PAUSED...);
+            рисуется на кадре только при with_text=True (в Qt-окне — в статусбаре).
+        :param with_text: рисовать ли текст счётчиков (in/out) и status_text на
+            кадре. False — оставить графику линии/зоны и blob/bbox/mask;
+            задачи 20.
         """
         if frame is None or frame.size == 0:
             return frame
@@ -152,19 +206,22 @@ class GuiOverlay:
                 cv2.putText(frame, label, (tx, ty), self.FONT,
                             max(self.MIN_FONT_SCALE, 0.6), color, 2, cv2.LINE_AA)
 
-        # 4) счётчики: линия/зона (line_counter.draw) + крупные in/out в углу
+        # 4) счётчики: линия/зона (line_counter.draw) — всегда; крупные in/out
+        #    в углу — только при with_text=True (в Qt-окне текст переносится
+        #    в статусбар, задачи 20)
         if self.debug.show_counters and counters:
             for c in counters:
                 c.draw(frame)
-            y = 36
-            for c in counters:
-                # put_text: кириллические id счётчиков тоже отрисовываются (PIL/TTF);
-                # чёрная тень включена — читаемость над ярким фоном
-                put_text(frame, c.label_text(), (10, y), size_px=22,
-                         color=(255, 255, 255))
-                y += 34
+            if with_text:
+                y = 36
+                for c in counters:
+                    # put_text: кириллические id счётчиков тоже отрисовываются (PIL/TTF);
+                    # чёрная тень включена — читаемость над ярким фоном
+                    put_text(frame, c.label_text(), (10, y), size_px=22,
+                             color=(255, 255, 255))
+                    y += 34
 
-        if status_text:
+        if with_text and status_text:
             w = frame.shape[1]
             tw = text_width(status_text, size_px=16)
             put_text(frame, status_text, (max(0, w - tw - 10), 12),
@@ -190,6 +247,11 @@ class GuiPlayer:
     Клавиши: **пробел** — пауза/далее; **q**/**ESC** — выход; **+**/**=**,
     **-**/**−** — скорость ×1.5 / ÷1.5 (в пределах 0.25..8); **`,`**/**`.`** —
     масштаб ОТОБРАЖЕНИЯ пресеты 0.5/1/1.5/2 (только экран, обработка не меняется).
+
+    Публичный API для внешнего драйвера окна (Qt, задача 17): :meth:`handle_key`
+    (обёртка над ``_handle_key``), :meth:`tick` (один шаг кадра без imshow;
+    cv2-цикл :meth:`run` переписан через него) и :meth:`finalize` (финальная
+    сводка + markdown-отчёт, идемпотентна).
     """
 
     #: Имя окна — только ASCII: GNOME/GTK использует заголовок для имени файла
@@ -207,12 +269,35 @@ class GuiPlayer:
         self.speed: float = clamp_speed(speed)
         self.window_name = window_name or self.DEFAULT_WINDOW
         self.overlay = GuiOverlay(self.cfg.debug)
+        # задачи 20: рисовать ли текст счётчиков/status_text на кадре. cv2-run и
+        # headless — True (текст в кадр); Qt count-окно ставит False (текст в
+        # статусбар, на кадре только гракция линии/зоны). Сеттер извне.
+        self.overlay_with_text = True
         #: масштаб ОТОБРАЖЕНИЯ (клавиши `,`/`.`; старт — initial_scale/--scale):
         #: применяем только перед imshow, обработка/детекция — всегда в исходном разрешении
         self.scale: float = initial_scale
         self._stop = False
         self._paused = False
         self._last_view: np.ndarray | None = None  # удержание кадра в паузе
+        # задача 17 — API для внешнего драйвера (Qt-окно): состояние последнего шага
+        self.frame_index: int | None = None   # индекс последнего обработанного кадра
+        self.proc_dt: float = 0.0             # время обработки последнего кадра (pacing)
+        self.last_message: str = ""           # последнее событие (для статусбара Qt-окна)
+        self._proc_ema: float = 0.0           # EMA времени обработки (проц-fps в статусе)
+        self._finalized: bool = False         # finalize() идемпотентен
+
+    # ------------------------------------------------------------- публичный API (задача 17)
+    def handle_key(self, key: int) -> None:
+        """Публичная обёртка над :meth:`_handle_key` (коды cv2 ``waitKey & 0xFF``).
+
+        Для внешнего драйвера окна (Qt-кнопки/клавиатура): логика та же —
+        q/ESC — выход, пробел — пауза, +/- — скорость, `,`/`.` — масштаб.
+        """
+        self._handle_key(key)
+
+    def status_text(self, proc_fps: float, frame_index: int | None = None) -> str:
+        """Публичный alias :meth:`_status_text` (строка статуса для статусбара)."""
+        return self._status_text(proc_fps, frame_index=frame_index)
 
     # ------------------------------------------------------------------ headless
     @staticmethod
@@ -298,6 +383,78 @@ class GuiPlayer:
                 txt += f"   {extra}"
         return txt
 
+    # ------------------------------------------------------------- tick/finalize (задача 17)
+    def tick(self) -> Optional[np.ndarray]:
+        """Один шаг «кадра цикла» БЕЗ окна (используется cv2-run и Qt-окном).
+
+        * пауза → вернуть последний сохранённый view (как cv2-run: удержание кадра);
+        * иначе — прочитать кадр из pipeline, ``_process_frame``, overlay,
+          ``_scaled_view``; источник открывается лениво (``build()`` + авто-масштаб);
+        * EOF / stop → ``None``.
+
+        :returns: кадр для отображения (с учётом ``self.scale``) или ``None`` — завершить.
+        """
+        pipe = self.pipeline
+        if pipe.source is None:
+            pipe.build()
+            # задача 14: маленький кадр → авто-увеличение масштаба отображения
+            # (идемпотентно/монотонно — run() применяет тот же вызов перед циклом)
+            self.scale = auto_ui_scale(pipe.source.width, pipe.source.height, self.scale)
+        if self._paused:
+            return self._scaled_view(self._last_view) if self._last_view is not None else None
+        while not self._stop:
+            frame = pipe.source.read()
+            if frame is None:
+                # разрыв потока (не EOF): read() внутри уже отспал backoff
+                if isinstance(pipe.source, FfmpegPipeSource) and not pipe.source.exhausted:
+                    time.sleep(0.1)
+                    continue
+                return None   # EOF файла / источник исчерпан
+            break
+        if self._stop:
+            return None
+
+        t0 = time.monotonic()
+        blobs, objects = self._process_frame(frame)
+        mask = getattr(pipe.detector, "last_mask", None)
+        proc_dt = max(1e-6, time.monotonic() - t0)
+        self.proc_dt = proc_dt
+        self._proc_ema = 0.9 * self._proc_ema + 0.1 * proc_dt if self._proc_ema else proc_dt
+        self.frame_index = frame.index
+
+        view = self.overlay.draw(
+            frame.image, objects=objects, blobs=blobs, mask=mask,
+            counters=pipe.counters,
+            status_text=self.status_text(1.0 / max(1e-6, self._proc_ema),
+                                         frame_index=frame.index),
+            with_text=self.overlay_with_text)
+        # отладочные кадры с overlay (cfg.debug.save_debug_frames_dir)
+        dbg = self.cfg.debug
+        if dbg.save_debug_frames_dir and \
+                frame.index % max(1, int(dbg.debug_frame_step)) == 0:
+            save_debug_frame(view, dbg.save_debug_frames_dir, frame.index)
+        self._last_view = view
+        # масштаб ОТОБРАЖЕНИЯ — только для вывода (обработка — в исходном разрешении)
+        return self._scaled_view(view)
+
+    def finalize(self, reason: str) -> None:
+        """Финальное завершение: финальная сводка + markdown-отчёт с причиной + close.
+
+        Идемпотентна (флаг ``_finalized``): cv2-run и Qt-окно вызывают её в своём
+        ``finally``, повторные вызовы игнорируются (отчёт записывается один раз).
+        """
+        if self._finalized:
+            return
+        self._finalized = True
+        pipe = self.pipeline
+        # markdown-отчёт — до close(): нужны fps/duration источника.
+        # Сводка — только если конвейер собран (event_log создан в build());
+        # закрытие окна раньше первого кадра (source None) — без сводки.
+        if pipe.event_log is not None:
+            pipe._print_final(reason)
+        pipe._write_report(reason)
+        pipe.close()
+
     # ------------------------------------------------------------------ run
     def _process_frame(self, frame) -> tuple[list[Blob], list[TrackedObject]]:
         """Один кадр через компоненты pipeline (аналог Pipeline.step + blobs/mask)."""
@@ -327,8 +484,10 @@ class GuiPlayer:
         if events:
             pipe.event_log.log_events(events)
             for ev in events:
-                _emit(f"СОБЫТИЕ {ev.counter_id} {ev.direction} track={ev.track_id} "
-                      f"@ ({ev.x_px:.0f},{ev.y_px:.0f}) frame={ev.frame_index}")
+                msg = (f"СОБЫТИЕ {ev.counter_id} {ev.direction} track={ev.track_id} "
+                       f"@ ({ev.x_px:.0f},{ev.y_px:.0f}) frame={ev.frame_index}")
+                _emit(msg)
+                self.last_message = msg   # для статусбара Qt-окна (задача 17)
         return blobs, objects
 
     def run(self) -> int:
@@ -340,67 +499,40 @@ class GuiPlayer:
         if not self.available():
             raise RuntimeError(self.unavailable_reason())
 
+        apply_qt_env()   # только для cv2-окна (до создания HighGUI/QApplication)
         pipe = self.pipeline
         if pipe.source is None:
             pipe.build()
         src = pipe.source
+        # задача 14: маленький кадр (маленький ROI) → авто-увеличение масштаба
+        # отображения, чтобы UI был доступен; user --scale — минимум; статус покажет scale=…x
+        self.scale = auto_ui_scale(src.width, src.height, self.scale)
         fps = float(src.fps or 0.0)
         if fps <= 0:
             fps = float(self.cfg.processing.effective_fps or 25.0)
         _emit(f"GUI-режим: окно {self.window_name!r}, speed={self.speed:g}x "
               f"(+/- ×/÷1.5, ,/. масштаб 0.5-2 только экран, space — пауза, q/ESC — выход)")
 
-        last_proc_dt = 0.0
         try:
+            # задача 17: цикл переписан через публичный tick() (тот же pacing) —
+            # та же логика, что у Qt-окна; поведение cv2-варианта сохранено.
             while not self._stop:
-                if self._paused:
-                    # пауза: не читаем новые кадры, держим последний на экране
-                    if self._last_view is not None:
-                        cv2.imshow(self.window_name, self._scaled_view(self._last_view))
-                    key = cv2.waitKey(1) & 0xFF
-                    self._handle_key(key)
-                    continue
-
-                frame = src.read()
-                if frame is None:
-                    # разрыв потока (не EOF): read() внутри уже отспал backoff
-                    if isinstance(src, FfmpegPipeSource) and not src.exhausted:
-                        time.sleep(0.1)
-                        continue
-                    break  # EOF файла / источник исчерпан
-
-                t0 = time.monotonic()
-                blobs, objects = self._process_frame(frame)
-                mask = getattr(pipe.detector, "last_mask", None)
-                proc_dt = max(1e-6, time.monotonic() - t0)
-                last_proc_dt = 0.9 * last_proc_dt + 0.1 * proc_dt if last_proc_dt else proc_dt
-
-                view = self.overlay.draw(
-                    frame.image, objects=objects, blobs=blobs, mask=mask,
-                    counters=pipe.counters,
-                    status_text=self._status_text(
-                        1.0 / max(1e-6, last_proc_dt), frame_index=frame.index))
-                # отладочные кадры с overlay (cfg.debug.save_debug_frames_dir)
-                dbg = self.cfg.debug
-                if dbg.save_debug_frames_dir and \
-                        frame.index % max(1, int(dbg.debug_frame_step)) == 0:
-                    save_debug_frame(view, dbg.save_debug_frames_dir, frame.index)
-                self._last_view = view
-                # масштаб ОТОБРАЖЕНИЯ — только перед imshow (debug-кадры и обработка
-                # остаются в исходном разрешении)
-                cv2.imshow(self.window_name, self._scaled_view(view))
+                view = self.tick()
+                if view is None:
+                    break   # EOF / источник исчерпан / stop
+                cv2.imshow(self.window_name, view)
                 key = cv2.waitKey(1) & 0xFF
                 self._handle_key(key)
 
-                # темп: (1/fps) / speed минус время обработки кадра
-                if fps > 0:
-                    target = (1.0 / fps) / self.speed - proc_dt
+                # темп: (1/fps) / speed минус время обработки кадра (в паузе — без сна,
+                # как раньше: waitKey(1) даёт реалтайм-задержку)
+                if not self._paused and fps > 0:
+                    target = (1.0 / fps) / self.speed - self.proc_dt
                     if target > 0:
                         time.sleep(target)
         finally:
             cv2.destroyAllWindows()
-            # markdown-отчёт (задача 10) — как в headless: до close(), нужны fps/duration
-            pipe._write_report("окно закрыто (GUI)")
-            pipe.close()
+            # финальная сводка + markdown-отчёт (до close(): нужны fps/duration)
+            self.finalize("окно закрыто (GUI)")
         _emit("GUI-режим: окно закрыто")
         return 0

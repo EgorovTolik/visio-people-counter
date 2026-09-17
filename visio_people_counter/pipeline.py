@@ -48,7 +48,7 @@ from typing import Optional, Union
 import cv2
 import numpy as np
 
-from .config import Config, describe_frame_range
+from .config import Config, describe_frame_range, describe_roi
 from .event_log import EventLog
 from .line_counter import BaseCounter, CrossingEvent, LineCounter, ZoneCounter, build_counters
 from .report import RunMeta, build_report, choose_report_path, write_report
@@ -194,11 +194,14 @@ class Pipeline:
         if not v.path:
             raise VideoSourceError("video.path пустой — задайте путь в конфиге или --video")
 
+        # ROI (processing.roi) — кроп на уровне источника: весь конвейер видит
+        # ROI-кадр как полный; координаты конфига/событий отсчитываются от ROI.
+        roi = self.cfg.processing.roi
         if v.type == "file":
             p = Path(v.path).expanduser()
             if not is_url(v.path) and not p.is_file():
                 raise VideoSourceError(f"видеофайл не найден: {v.path!r}")
-            self.source = FileSource(str(p), loop_file=v.loop_file)
+            self.source = FileSource(str(p), loop_file=v.loop_file, roi=roi)
         else:  # hls (URL .m3u8/RTSP/http или локальный файл через ffmpeg-pipe)
             h = v.hls
             self.source = FfmpegPipeSource(
@@ -209,10 +212,14 @@ class Pipeline:
                 reconnect_backoff_s=h.reconnect_backoff_s,
                 bad_read_threshold=h.bad_read_threshold,
                 on_reconnect=self._on_reconnect,
+                roi=roi,
             )
 
         self.source.open()
         w, h = self.source.width, self.source.height
+        if roi is not None:
+            _emit(f"ROI применён: {describe_roi(roi)} (кроп на уровне источника; "
+                  f"координаты конфига и событий — в системе ROI)")
         _emit(f"источник: {v.type} {v.path!r} → {w}x{h}, fps источника={self.source.fps or 'н/д'}, "
               f"effective_fps={self.cfg.processing.effective_fps or 'нативный'}")
 
@@ -350,6 +357,9 @@ class Pipeline:
         print(f"обработано кадров : {self.frames_processed}", flush=True)
         p = self.cfg.processing
         print(f"интервал кадров   : {describe_frame_range(p.frame_start, p.frame_end)}", flush=True)
+        roi_txt = describe_roi(p.roi)
+        extra = "" if p.roi is None else " (координаты событий — в системе ROI)"
+        print(f"ROI               : {roi_txt}{extra}", flush=True)
         fps = f"avg={self.avg_fps:.1f} ema={self.ema_fps:.1f}"
         if self.last_lag_s is not None:
             fps += f" lag_last={self.last_lag_s:+.2f}s lag_max={self.max_lag_s:.2f}s"

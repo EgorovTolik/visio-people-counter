@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from visio_people_counter.config import (  # noqa: E402
-    Config, ConfigError, LineCounterConfig, ZoneCounterConfig,
+    Config, ConfigError, LineCounterConfig, ZoneCounterConfig, describe_roi,
 )
 
 EXAMPLE = ROOT / "config.example.yaml"
@@ -28,6 +28,7 @@ class TestConfigLoad(unittest.TestCase):
         self.assertEqual(cfg.processing.max_width, 0)
         self.assertIsNone(cfg.processing.frame_start)
         self.assertIsNone(cfg.processing.frame_end)
+        self.assertIsNone(cfg.processing.roi)   # roi: null в example = весь кадр
         self.assertEqual(cfg.motion.method, "mog2")
         self.assertEqual(cfg.motion.morph_open, (3, 3))
         self.assertEqual(cfg.motion.morph_close, (9, 15))
@@ -299,6 +300,75 @@ class TestProcessingFrameRange(unittest.TestCase):
             loaded = Config.load(p)
         self.assertEqual(loaded.processing.frame_start, 50)
         self.assertEqual(loaded.processing.frame_end, 120)
+
+
+class TestProcessingRoi(unittest.TestCase):
+    """Задача 13: processing.roi — [x, y, w, h] доли полного кадра (0..1]."""
+
+    def _load(self, roi):
+        return Config.from_dict({
+            "video": {"type": "file", "path": "x.mp4"},
+            "processing": {"roi": roi},
+            "counters": [{"id": "l1", "type": "line", "a": [0.2, 0.3], "b": [0.8, 0.9]}],
+        }).processing.roi
+
+    def test_valid_roi(self):
+        self.assertEqual(self._load([0.2, 0.3, 0.6, 0.4]), [0.2, 0.3, 0.6, 0.4])
+
+    def test_full_frame_boundary_ok(self):
+        # x + w == 1 и y + h == 1 — на границе кадра допустимо
+        self.assertEqual(self._load([0.5, 0.25, 0.5, 0.75]), [0.5, 0.25, 0.5, 0.75])
+
+    def test_null_and_absent_mean_whole_frame(self):
+        self.assertIsNone(self._load(None))
+        cfg = Config.from_dict({"video": {"type": "file", "path": "x.mp4"}})
+        self.assertIsNone(cfg.processing.roi)
+
+    def test_x_plus_w_greater_than_one_raises(self):
+        with self.assertRaises(ConfigError) as ctx:
+            self._load([0.6, 0.3, 0.5, 0.4])
+        self.assertIn("x + w", str(ctx.exception))
+
+    def test_y_plus_h_greater_than_one_raises(self):
+        with self.assertRaises(ConfigError) as ctx:
+            self._load([0.2, 0.7, 0.6, 0.4])
+        self.assertIn("y + h", str(ctx.exception))
+
+    def test_zero_or_negative_value_raises(self):
+        for bad in ([0.0, 0.3, 0.6, 0.4], [0.2, 0.3, -0.1, 0.4], [0.2, 0.0, 0.6, 0.0]):
+            with self.assertRaises(ConfigError) as ctx:
+                self._load(bad)
+            self.assertIn("processing.roi", str(ctx.exception))
+
+    def test_value_above_one_raises(self):
+        for bad in ([1.5, 0.3, 0.6, 0.4], [0.2, 0.3, 0.6, 2.0]):
+            with self.assertRaises(ConfigError) as ctx:
+                self._load(bad)
+            self.assertIn("(0..1]", str(ctx.exception))
+
+    def test_not_a_list_of_four_raises(self):
+        for bad in ("roi", [0.2, 0.3, 0.6], [0.2, 0.3, 0.6, 0.4, 0.1],
+                    [0.2, 0.3, "0.6", 0.4], [0.2, 0.3, True, 0.4]):
+            with self.assertRaises(ConfigError):
+                self._load(bad)
+
+    def test_save_load_roundtrip(self):
+        import tempfile
+        cfg = Config.from_dict({
+            "video": {"type": "file", "path": "x.mp4"},
+            "processing": {"roi": [0.2, 0.3, 0.6, 0.4]},
+            "counters": [{"id": "l1", "type": "line", "a": [0.2, 0.3], "b": [0.8, 0.9]}],
+        })
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "config.yaml"
+            Config.save(cfg, p)
+            loaded = Config.load(p)
+        self.assertEqual(loaded.processing.roi, [0.2, 0.3, 0.6, 0.4])
+
+    def test_describe_roi(self):
+        self.assertEqual(describe_roi(None), "нет")
+        self.assertEqual(describe_roi([0.1, 0.2, 0.8, 0.6]), "0.1–0.9 × 0.2–0.8")
+        self.assertEqual(describe_roi([0.2, 0.3, 0.6, 0.4]), "0.2–0.8 × 0.3–0.7")
 
 
 if __name__ == "__main__":

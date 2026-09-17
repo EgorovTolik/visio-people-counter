@@ -27,10 +27,12 @@ from visio_people_counter.calibrate import (
     delete_current_counter,
     load_counter_into_state,
     make_new_counter_id,
+    MIN_ROI_FRACTION,
     MIN_SIZE_FRACTION,
     SIZE_POINT_HIT_RADIUS_PX,
     handle_size_click,
     remove_size_point,
+    roi_from_two_clicks,
     size_point_at_click,
     undo_last_size_point,
     TimeInputBuffer,
@@ -441,11 +443,12 @@ class TestButtonLayoutAndHitTest(unittest.TestCase):
     def test_order_and_labels(self):
         btns = self._buttons(mode="line")
         self.assertEqual([b[0] for b in btns],
-                         ["line", "zone", "size", "mask", "show_all",
+                         ["line", "zone", "size", "roi", "mask", "show_all",
                           "prev", "next", "new_line", "new_zone", "delete",
                           "time", "save"])
         labels = {b[0]: b[1] for b in btns}
         self.assertEqual(labels["line"], "линия")
+        self.assertEqual(labels["roi"], "roi")
         self.assertEqual(labels["show_all"], "все")
         self.assertEqual(labels["size"], "размер")
         self.assertEqual(labels["new_line"], "+линия")
@@ -457,9 +460,16 @@ class TestButtonLayoutAndHitTest(unittest.TestCase):
         btns = {b[0]: b for b in self._buttons(mode="zone", mask_on=True)}
         self.assertTrue(btns["zone"][2])
         self.assertTrue(btns["mask"][2])
-        for name in ("line", "size", "show_all", "prev", "next",
+        for name in ("line", "size", "roi", "show_all", "prev", "next",
                     "new_line", "new_zone", "delete", "time", "save"):
             self.assertFalse(btns[name][2], f"{name} должен быть неактивным")
+
+    def test_roi_button_present_and_active_in_roi_mode(self):
+        btns = {b[0]: b for b in self._buttons(mode="roi")}
+        self.assertIn("roi", btns)
+        self.assertTrue(btns["roi"][2])
+        btns_off = {b[0]: b for b in self._buttons(mode=None)}
+        self.assertFalse(btns_off["roi"][2])
 
     def test_show_all_button_active(self):
         btns = {b[0]: b for b in self._buttons(mode=None, show_all=True)}
@@ -504,7 +514,8 @@ class TestButtonLayoutAndHitTest(unittest.TestCase):
         img = np.zeros((360, 900, 3), np.uint8)
         counters = [LineCounterConfig(id="m", a=(0.1, 0.1), b=(0.9, 0.9))]
         btns = draw_top_panel(img, "m", counters, mode="line", mask_on=False)
-        self.assertEqual(len(btns), 12)   # «−точка» скрыта из панели (есть [b] и клик по мерке)
+        self.assertEqual(len(btns), 13)   # «−точка» скрыта из панели (есть [b] и клик по мерке);
+                                          # roi — задача 13
         b = next(b for b in btns if b[0] == "line")
         _n, _l, active, x0, y0, x1, y1 = b
         self.assertTrue(active)
@@ -1409,7 +1420,78 @@ class TestSizePointHitAndDelete(unittest.TestCase):
         # панель не пересекается и помещается в кадр (авто-сужение работает)
         img = np.zeros((360, 480, 3), np.uint8)
         out = draw_top_panel(img, "m", [], mode="size", mask_on=False)
-        self.assertEqual(len(out), 12)
+        self.assertEqual(len(out), 13)   # roi — задача 13
+
+
+class TestRoiMode(unittest.TestCase):
+    """Задача 13: режим «ROI» — чистые функции (2 клика → [x,y,w,h], state, панель)."""
+
+    def test_roi_from_two_clicks_basic(self):
+        self.assertEqual(roi_from_two_clicks((0.2, 0.3), (0.8, 0.7)),
+                         [0.2, 0.3, 0.6, 0.4])
+
+    def test_roi_order_of_corners_does_not_matter(self):
+        self.assertEqual(roi_from_two_clicks((0.8, 0.7), (0.2, 0.3)),
+                         roi_from_two_clicks((0.2, 0.3), (0.8, 0.7)))
+
+    def test_roi_swapped_diagonal(self):
+        self.assertEqual(roi_from_two_clicks((0.9, 0.8), (0.4, 0.5)),
+                         [0.4, 0.5, 0.5, 0.3])
+
+    def test_roi_edge_clicks_clamped_to_config_range(self):
+        # клик точно по краям даёт x/y = eps > 0 (конфиг требует (0..1]),
+        # и x + w <= 1, y + h <= 1
+        x, y, w, h = roi_from_two_clicks((0.0, 0.0), (1.0, 1.0))
+        for v in (x, y, w, h):
+            self.assertGreater(v, 0.0)
+            self.assertLessEqual(v, 1.0)
+        self.assertLessEqual(x + w, 1.0)
+        self.assertLessEqual(y + h, 1.0)
+
+    def test_roi_same_point_is_degenerate(self):
+        x, y, w, h = roi_from_two_clicks((0.5, 0.5), (0.5, 0.5))
+        self.assertTrue(min(w, h) < MIN_ROI_FRACTION)
+
+    def test_state_roi_mode_collects_two_clicks(self):
+        st = CalibrationState()
+        st.set_mode("roi")
+        st.handle_click(0.2, 0.3)
+        st.handle_click(0.8, 0.7)
+        self.assertEqual(st.finish_roi(), [0.2, 0.3, 0.6, 0.4])
+
+    def test_state_roi_third_click_restarts(self):
+        st = CalibrationState()
+        st.set_mode("roi")
+        for pt in ((0.1, 0.1), (0.9, 0.9), (0.3, 0.4)):
+            st.handle_click(*pt)
+        self.assertEqual(len(st.roi_points), 1)
+
+    def test_finish_roi_without_two_points_raises(self):
+        st = CalibrationState()
+        st.set_mode("roi")
+        st.handle_click(0.1, 0.1)
+        with self.assertRaises(ValueError):
+            st.finish_roi()
+
+    def test_cancel_roi_keeps_other_geometry(self):
+        st = CalibrationState(counter_id="m")
+        st.mode = "line"
+        st.line_points = [(0.1, 0.2), (0.9, 0.8)]
+        st.set_mode("roi")
+        st.handle_click(0.2, 0.3)
+        st.cancel_roi()
+        self.assertIsNone(st.mode)
+        self.assertEqual(st.roi_points, [])
+        self.assertEqual(st.line_points, [(0.1, 0.2), (0.9, 0.8)])
+
+    def test_set_mode_invalid_still_raises(self):
+        st = CalibrationState()
+        with self.assertRaises(ValueError):
+            st.set_mode("foo")
+
+    def test_panel_contains_roi_button(self):
+        names = [b[0] for b in layout_buttons(None, False)]
+        self.assertIn("roi", names)
 
 
 class TestGuiProcessFrameFeedsReport(unittest.TestCase):
