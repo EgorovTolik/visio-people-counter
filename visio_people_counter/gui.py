@@ -550,8 +550,18 @@ class GuiPlayer:
         if events:
             pipe.event_log.log_events(events)
             for ev in events:
+                # процент обработки (аналог pipeline.py; учитывает frame_end)
+                src = getattr(pipe, 'source', None)
+                pct = ""
+                if src is not None and getattr(src, 'fps', 0) and getattr(src, 'duration', 0):
+                    video_total = int(src.duration * src.fps)
+                    fe = pipe.cfg.processing.frame_end
+                    total = min(fe + 1, video_total) if fe is not None else video_total
+                    if total > 0:
+                        pct = f" ({pipe.frames_processed}/{total}, " \
+                              f"{100.0 * pipe.frames_processed / total:.2f}%)"
                 msg = (f"СОБЫТИЕ {ev.counter_id} {ev.direction} track={ev.track_id} "
-                       f"@ ({ev.x_px:.0f},{ev.y_px:.0f}) frame={ev.frame_index}")
+                       f"@ ({ev.x_px:.0f},{ev.y_px:.0f}) frame={ev.frame_index}{pct}")
                 _emit(msg)
                 self.last_message = msg   # для статусбара Qt-окна (задача 17)
         return blobs, objects
