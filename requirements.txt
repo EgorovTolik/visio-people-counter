@@ -7,4 +7,8 @@ PyYAML>=6.0
 Pillow>=10.0    # on-screen текст с кириллицей (cv2.putText её не умеет);
                 # без Pillow/GUI-шрифта подписи фолбэкатся в ASCII
 PySide6>=6.5   # опционально: Qt-бэкенд GUI (calibrate --backend qt)
-ultralytics>=8.0    # optional: YOLO-детектор (processing.method: "yolo"); тянет torch
+ultralytics>=8.0    # optional: YOLO-детектор (processing.method: "yolo", backend: torch); тянет torch
+# optional: YOLO ONNX backend (CPU; processing.yolo.backend: onnx)
+onnxruntime>=1.16
+# optional: YOLO ONNX backend (GPU/CUDA)
+# onnxruntime-gpu>=1.16  # uncomment for GPU support
