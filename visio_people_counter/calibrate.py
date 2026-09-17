@@ -875,15 +875,20 @@ def draw_top_panel(img: np.ndarray, counter_id: str, counters,
                    mode: Optional[str], mask_on: bool,
                    show_all: bool = False, scale: float = 1.0,
                    frame_index: Optional[int] = None,
-                   roi_label: Optional[str] = None) -> list[Button]:
+                   roi_label: Optional[str] = None,
+                   ui_scale: float = 1.0) -> list[Button]:
     """Нарисовать вверху кадра статусную строку (с ``scale=…x``, ``кадр N`` и
     подписью ROI, если задан) + панель кнопок; вернуть раскладку для hit-test
-    в mouse-callback. Текст — только через put_text (кириллица)."""
+    в mouse-callback. Текст — только через put_text (кириллица).
+
+    ``ui_scale`` — компенсатор зума: все размеры оверлея умножаются на него,
+    чтобы после ресайза img на factor scale on-screen размер оставался постоянным.
+    """
     put_text(img, counter_status_text(counter_id, counters, scale,
                                       frame_index=frame_index,
                                       roi_label=roi_label), (10, 8),
-             size_px=20, color=(255, 255, 255))
-    font = 20
+             size_px=int(round(20 * ui_scale)), color=(255, 255, 255))
+    font = int(round(20 * ui_scale))
     buttons = layout_buttons(mode, mask_on, show_all=show_all, font_px=font)
     # узкий кадр: сужаем шрифт кнопок (не ниже 12px), чтобы вся строка помещалась
     while buttons and buttons[-1][5] > img.shape[1] - 4 and font > 12:
@@ -953,7 +958,8 @@ def _dashed_line(img: np.ndarray, p1: tuple[int, int], p2: tuple[int, int],
 def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
                       mask: Optional[np.ndarray], w: int, h: int,
                       mouse_pos: Optional[tuple[int, int]] = None,
-                      active_roi: Optional[list[float]] = None) -> np.ndarray:
+                      active_roi: Optional[list[float]] = None,
+                      *, ui_scale: float = 1.0) -> np.ndarray:
     """Отрисовка состояния калибровки на копии кадра (чистая функция).
 
     ``mouse_pos`` — текущая позиция курсора (для live-превью pending «мерки роста»);
@@ -969,22 +975,27 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
     def px(p: tuple[float, float]) -> tuple[int, int]:
         return (int(round(p[0] * w)), int(round(p[1] * h)))
 
+    # Компенсатор зума: все размеры оверлея умножаются на ui_scale, чтобы после
+    # ресайза img на factor scale их on-screen размер оставался постоянным.
+    def sz(v: float) -> int:
+        return max(1, int(round(v * ui_scale)))
+
     if state.line_points:
         pts = [px(p) for p in state.line_points]
         for i, p in enumerate(pts):
-            cv2.circle(img, p, 5, (0, 255, 0), -1)
-            cv2.putText(img, "A" if i == 0 else "B", (p[0] + 8, p[1] + 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.circle(img, p, sz(5), (0, 255, 0), -1)
+            cv2.putText(img, "A" if i == 0 else "B", (p[0] + sz(8), p[1] + sz(6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7 * ui_scale, (0, 255, 0), sz(2), cv2.LINE_AA)
         if len(pts) == 2:
-            cv2.line(img, pts[0], pts[1], (0, 255, 0), 2, lineType=cv2.LINE_AA)
+            cv2.line(img, pts[0], pts[1], (0, 255, 0), sz(2), lineType=cv2.LINE_AA)
 
     if state.zone_points:
         pts = [px(p) for p in state.zone_points]
         for p in pts:
-            cv2.circle(img, p, 4, (0, 200, 255), -1)
+            cv2.circle(img, p, sz(4), (0, 200, 255), -1)
         if len(pts) >= 2:
             cv2.polylines(img, [np.array(pts, dtype=np.int32)], False,
-                          (0, 200, 255), 2, lineType=cv2.LINE_AA)
+                          (0, 200, 255), sz(2), lineType=cv2.LINE_AA)
 
     for x_f, y_f, h_f in state.size_points:
         # ЗАВЕРШЁННАЯ «мерка роста» = (x_frac, y_frac, доля высоты человека):
@@ -995,11 +1006,11 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
         seg_h = int(round(h_f * h))
         top = max(0, yc - seg_h // 2)
         bottom = min(h - 1, yc + seg_h // 2)
-        cv2.line(img, (x, top), (x, bottom), (0, 255, 255), 2)
+        cv2.line(img, (x, top), (x, bottom), (0, 255, 255), sz(2))
         for ep in ((x, top), (x, bottom)):
-            cv2.circle(img, ep, 3, (0, 255, 255), -1)
-        put_text(img, f"размер: {int(round(h_f * 100))}%", (x + 6, max(4, yc - 8)),
-                 size_px=14, color=(0, 255, 255))
+            cv2.circle(img, ep, sz(3), (0, 255, 255), -1)
+        put_text(img, f"размер: {int(round(h_f * 100))}%", (x + sz(6), max(4, yc - sz(8))),
+                 size_px=int(round(14 * ui_scale)), color=(0, 255, 255))
 
     # PENDING «мерка роста»: первый клик запомнен — рисуем маркер + пунктирное
     # превью до текущего курсора с текущей длиной (px / % высоты кадра)
@@ -1007,45 +1018,47 @@ def _draw_calibration(base: np.ndarray, state: CalibrationState, mask_on: bool,
     if first is not None:
         fx = int(round(first[0] * w))
         fy = max(0, min(h - 1, int(round(first[1] * h))))
-        cv2.circle(img, (fx, fy), 5, (0, 165, 255), -1)
+        cv2.circle(img, (fx, fy), sz(5), (0, 165, 255), -1)
         put_text(img, "мерка: кликните 2-ю точку (низ/верх человека)",
-                 (max(4, fx + 8), max(4, fy - 10)), size_px=14, color=(0, 165, 255))
+                 (max(4, fx + sz(8)), max(4, fy - sz(10))), size_px=int(round(14 * ui_scale)),
+                 color=(0, 165, 255))
         if mouse_pos is not None:
             mx, my = mouse_pos
-            _dashed_line(img, (fx, fy), (mx, my), (0, 165, 255), thickness=2)
+            _dashed_line(img, (fx, fy), (mx, my), (0, 165, 255), thickness=sz(2))
             len_px = abs(my - fy)
             pct = int(round(len_px / h * 100)) if h > 0 else 0
             put_text(img, f"{len_px}px ({pct}% кадра)",
-                     (max(4, mx + 8), max(4, my - 10)), size_px=14,
-                     color=(0, 165, 255))
+                     (max(4, mx + sz(8)), max(4, my - sz(10))),
+                     size_px=int(round(14 * ui_scale)), color=(0, 165, 255))
 
     # режим «ROI»: два клика по углам — зелёные маркеры + пунктирная рамка-превью
     roi_pts = getattr(state, "roi_points", [])
     if roi_pts:
         rpts = [(int(round(px_ * w)), int(round(py_ * h))) for px_, py_ in roi_pts]
         for p in rpts:
-            cv2.circle(img, p, 5, (0, 255, 0), -1)
+            cv2.circle(img, p, sz(5), (0, 255, 0), -1)
         if len(roi_pts) >= 2:
             (ax, ay), (bx, by) = rpts[0], rpts[1]
             rx0, ry0 = min(ax, bx), min(ay, by)
             rx1, ry1 = max(ax, bx), max(ay, by)
-            cv2.rectangle(img, (rx0, ry0), (rx1, ry1), (0, 255, 0), 2, lineType=cv2.LINE_AA)
+            cv2.rectangle(img, (rx0, ry0), (rx1, ry1), (0, 255, 0), sz(2), lineType=cv2.LINE_AA)
             put_text(img, "ROI: Enter — принять | r — заново | ESC — отмена",
-                     (max(4, rx0), max(72, min(ry1 + 8, h - 20))),
-                     size_px=14, color=(0, 255, 0))
+                     (max(4, rx0), max(72, min(ry1 + sz(8), h - sz(20)))),
+                     size_px=int(round(14 * ui_scale)), color=(0, 255, 0))
 
-    # принятый ROI: кадр — уже ROI-вид; рамка по краям (внутри 4 px) как напоминание
+    # принятый ROI: кадр — уже ROI-вид; рамка по краям (внутри px) как напоминание
     if active_roi is not None and state.mode != "roi":
-        m = 4
-        cv2.rectangle(img, (m, m), (w - 1 - m, h - 1 - m), (0, 255, 0), 3,
+        m = sz(4)
+        cv2.rectangle(img, (m, m), (w - 1 - m, h - 1 - m), (0, 255, 0), sz(3),
                       lineType=cv2.LINE_AA)
 
     # подсказки внизу кадра (верх занят статусной строкой + панелью кнопок)
     hint_lines = _HINTS[state.mode].split("\n")
-    y = h - 18 - 22 * len(hint_lines)
+    y = h - sz(18) - sz(22) * len(hint_lines)
     for line in hint_lines:
-        put_text(img, line, (10, max(4, y)), size_px=16, color=(255, 255, 255))
-        y += 22
+        put_text(img, line, (sz(10), max(4, y)), size_px=int(round(16 * ui_scale)),
+                 color=(255, 255, 255))
+        y += sz(22)
     return img
 
 
