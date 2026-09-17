@@ -39,7 +39,9 @@ from .video_source import FfmpegPipeSource
 
 #: допустимый диапазон скорости воспроизведения (CLI --speed и клавиши +/-).
 MIN_SPEED = 0.25
-MAX_SPEED = 8.0
+#: верхнее ограничение скорости — очень большое (фактически без ограничения);
+#: клавиши +/- ограничиваются им, CLI --speed принимает любое > 0.
+MAX_SPEED = 1e6
 
 #: задача 14 — авто-масштаб окна при маленьком кадре (маленький ROI):
 #: минимальный «размер окна» для доступного UI (панель кнопок + статусная строка)
@@ -99,7 +101,7 @@ def apply_qt_env() -> None:
 
 
 def clamp_speed(speed: float) -> float:
-    """Привести скорость к диапазону [:data:`MIN_SPEED`, :data:`MAX_SPEED`]."""
+    """Привести скорость к [MIN_SPEED, MAX_SPEED] (верхний предел очень большой)."""
     return max(MIN_SPEED, min(MAX_SPEED, float(speed)))
 
 
