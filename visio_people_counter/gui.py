@@ -397,7 +397,8 @@ class GuiPlayer:
         if frame_index is not None:
             # время/продолжительность: hh:mm:ss
             src = getattr(self.pipeline, 'source', None)
-            fps = getattr(src, 'fps', 0) if src else 0
+            fps_ovr = self.cfg.processing.fps_override
+            fps = fps_ovr if fps_ovr > 0 else (getattr(src, 'fps', 0) if src else 0)
             duration = getattr(src, 'duration', 0) if src else 0
             # если frame_end задан — показываем ограниченную длительность (time_end)
             fe = self.cfg.processing.frame_end
@@ -618,7 +619,8 @@ class GuiPlayer:
         # задача 14: маленький кадр (маленький ROI) → авто-увеличение масштаба
         # отображения, чтобы UI был доступен; user --scale — минимум; статус покажет scale=…x
         self.scale = auto_ui_scale(src.width, src.height, self.scale)
-        fps = float(src.fps or 0.0)
+        fps_ovr = self.cfg.processing.fps_override
+        fps = fps_ovr if fps_ovr > 0 else float(src.fps or 0.0)
         if fps <= 0:
             fps = float(self.cfg.processing.effective_fps or 25.0)
         _emit(f"GUI-режим: окно {self.window_name!r}, speed={self.speed:g}x "

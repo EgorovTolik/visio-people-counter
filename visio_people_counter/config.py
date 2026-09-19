@@ -331,7 +331,10 @@ class ProcessingConfig:
     ``frame_start <= index <= frame_end`` (обе границы включительно).
     """
     effective_fps: float = 0             # 0 = нативный fps источника
-    max_width: int = 0                   # даунскейл до ширины; 0 = как в источнике
+    max_width: int = 0                   # даунскейл до ширины; 0 = как в источине
+    #: явный override частоты кадров (если cv2/ffprobe определяют неверно, напр. VFR);
+    #: > 0 — используется для всех расчётов (time→frames, таймер, pacing); 0 = авто.
+    fps_override: float = 0
     frame_start: Optional[int] = None    # первый кадр подсчёта (0-based, включительно); null = без границы
     frame_end: Optional[int] = None      # последний кадр подсчёта (0-based, включительно); null = до конца
     #: время в секундах (приоритет над frame_start/frame_end): если time_start задан,
@@ -354,7 +357,7 @@ class ProcessingConfig:
     def from_dict(cls, d: Any) -> "ProcessingConfig":
         d = _as_dict(d, "processing")
         _check_unknown_keys(
-            d, {"effective_fps", "max_width", "frame_start", "frame_end",
+            d, {"effective_fps", "max_width", "fps_override", "frame_start", "frame_end",
                 "time_start", "time_end", "roi", "method", "yolo"}, "processing"
         )
         method = _get_enum(d, "method", "processing", "mog2", {"mog2", "yolo"})
@@ -406,7 +409,11 @@ class ProcessingConfig:
             if te < 0:
                 raise ConfigError(f"processing.time_end: ожидалось >= 0, получено {te!r}")
         roi = _get_roi(d, "roi", "processing")
-        return cls(effective_fps=eff, max_width=mw, frame_start=fs, frame_end=fe,
+        fps_ovr = float(d.get("fps_override") or 0.0)
+        if fps_ovr < 0:
+            raise ConfigError(f"processing.fps_override: ожидалось >= 0, получено {fps_ovr!r}")
+        return cls(effective_fps=eff, max_width=mw, fps_override=fps_ovr,
+                   frame_start=fs, frame_end=fe,
                    time_start=ts, time_end=te, roi=roi, method=method, yolo=yolo)
 
 

@@ -210,6 +210,14 @@ class FileSource(VideoSource):
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(cap.get(cv2.CAP_PROP_FPS))
+        # ffprobe даёт более точный fps для VFR-видео (если cv2 вернул 0 или подозрительно)
+        if fps <= 0 or fps > 120:   # >120 — вероятно, мусор (напр. 600 из VLC)
+            try:
+                info = ffprobe_info(self._path)
+                if info["fps"] and info["fps"] > 0 and info["fps"] <= 120:
+                    fps = info["fps"]
+            except VideoSourceError:
+                pass   # ffprobe недоступен/не работает — остаёмся с cv2 значением
         if w <= 0 or h <= 0:
             raise VideoSourceError(f"{self._path!r}: ffprobe/cv2 не вернули разрешение ({w}x{h})")
         self.roi_px = None

@@ -271,9 +271,10 @@ class Pipeline:
 
         Приоритет: если time_start задан — frame_start = int(time_start * fps);
         аналогично time_end → frame_end. Старые frame_* без time_* не трогаются.
+        fps берётся из fps_override (если > 0), иначе source.fps.
         """
         p = self.cfg.processing
-        fps = self.source.fps if self.source else 0
+        fps = p.fps_override if p.fps_override > 0 else (self.source.fps if self.source else 0)
         if not fps:
             return   # fps неизвестен — не можем конвертировать
         if p.time_start is not None:
