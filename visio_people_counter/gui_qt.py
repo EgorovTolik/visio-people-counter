@@ -285,16 +285,26 @@ class CalibrateQtWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self._msg_widget)
         self.statusBar().showMessage(self._status_text())
 
-        # цикл по таймеру: реалтайм fps источника (как cv2-драйвер); fps<=0 → 33 мс
-        fps = 0.0
-        pipe = getattr(ctrl, "_pipe", None)
-        source = getattr(pipe, "source", None) if pipe is not None else None
-        if source is not None:
-            fps = float(getattr(source, "fps", 0.0) or 0.0)
+        # цикл по таймеру: реалтайм fps (override → duration_s → source); fps<=0 → 33 мс
+        fps = self._resolve_fps()
         interval_ms = int(round(1000.0 / fps)) if fps > 0 else 33
         self.timer = QTimer(self)
         self.timer.setInterval(max(1, min(interval_ms, 1000)))
         self.timer.timeout.connect(self.tick)
+
+    def _resolve_fps(self) -> float:
+        """Реальный fps: override → duration_s+frame_count → source.fps."""
+        pipe = getattr(self.ctrl, "_pipe", None)
+        src = getattr(pipe, "source", None) if pipe is not None else None
+        cfg_p = getattr(pipe, "cfg", None).processing if pipe is not None else None
+        if cfg_p is not None:
+            if cfg_p.fps_override > 0:
+                return cfg_p.fps_override
+            if cfg_p.duration_s > 0 and src is not None and hasattr(src, 'frame_count'):
+                fc = src.frame_count
+                if fc and fc > 0:
+                    return fc / cfg_p.duration_s
+        return float(getattr(src, "fps", 0.0) or 0.0) if src is not None else 0.0
 
     # ------------------------------------------------------------------ действия
     def _on_action(self, name: str) -> None:
@@ -540,6 +550,19 @@ class CountQtWindow(QMainWindow):
                 return key
         raise KeyError(name)
 
+    def _resolve_fps(self) -> float:
+        """Реальный fps: override → duration_s+frame_count → source.fps."""
+        p = self.player
+        cfg = p.cfg.processing
+        if cfg.fps_override > 0:
+            return cfg.fps_override
+        src = getattr(p.pipeline, 'source', None)
+        if cfg.duration_s > 0 and src is not None and hasattr(src, 'frame_count'):
+            fc = src.frame_count
+            if fc and fc > 0:
+                return fc / cfg.duration_s
+        return float(getattr(src, 'fps', 0.0) or 0.0) if src is not None else 0.0
+
     def _on_button(self, name: str) -> None:
         """Нажатие кнопки тулбара → ``player.handle_key(код cv2-клавиши)``."""
         self.player.handle_key(self._key_of(name))
@@ -571,8 +594,7 @@ class CountQtWindow(QMainWindow):
             act.blockSignals(True)   # не дёргать handle_key при пересинхронизации
             act.setChecked(p._paused)
             act.blockSignals(False)
-        src = getattr(p.pipeline, "source", None)
-        fps = float(getattr(src, "fps", 0.0) or 0.0) if src is not None else 0.0
+        fps = self._resolve_fps()
         interval = (int(round(1000.0 / (fps * p.speed)))
                     if fps > 0 and p.speed > 0 else 33)
         self.timer.setInterval(max(1, min(interval, 1000)))
