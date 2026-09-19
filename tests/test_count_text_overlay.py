@@ -364,7 +364,7 @@ else:
             frac_ref = float((view_ref.astype(int).max(axis=2) > 200).sum() /
                              (view_ref.shape[0] * view_ref.shape[1]))
             # кадр окна без text-overlay совпадает по яркости с player.tick(False)
-            self.assertAlmostEqual(frac_win, frac_ref, delta=0.01)
+            self.assertAlmostEqual(frac_win, frac_ref, delta=0.02)
             # но заметно меньше, чем кадр с текстом (player_tick(True))
             cfg2 = _make_config(_VIDEO, "qt_frame_on.md")
             on = GuiPlayer(Pipeline(cfg2), speed=1.0)

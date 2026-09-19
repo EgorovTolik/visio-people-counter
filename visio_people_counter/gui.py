@@ -468,6 +468,12 @@ class GuiPlayer:
             break
         if self._stop:
             return None
+        # frame_end: корректное завершение (как при q/ESC) — отчёт + выход
+        fe = self.cfg.processing.frame_end
+        if fe is not None and frame.index > fe:
+            _emit(f"GUI: достигнут frame_end={fe} — останавливаюсь")
+            self._stop = True
+            return None
 
         t0 = time.monotonic()
         blobs, objects = self._process_frame(frame)
