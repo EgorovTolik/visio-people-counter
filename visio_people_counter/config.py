@@ -335,6 +335,9 @@ class ProcessingConfig:
     #: явный override частоты кадров (если cv2/ffprobe определяют неверно, напр. VFR);
     #: > 0 — используется для всех расчётов (time→frames, таймер, pacing); 0 = авто.
     fps_override: float = 0
+    #: общая длительность видео в секундах (опционально): если fps_override=0 и
+    #: duration_s > 0 → реальный fps = frame_count / duration_s (точнее для VFR).
+    duration_s: float = 0
     frame_start: Optional[int] = None    # первый кадр подсчёта (0-based, включительно); null = без границы
     frame_end: Optional[int] = None      # последний кадр подсчёта (0-based, включительно); null = до конца
     #: время в секундах (приоритет над frame_start/frame_end): если time_start задан,
@@ -357,7 +360,8 @@ class ProcessingConfig:
     def from_dict(cls, d: Any) -> "ProcessingConfig":
         d = _as_dict(d, "processing")
         _check_unknown_keys(
-            d, {"effective_fps", "max_width", "fps_override", "frame_start", "frame_end",
+            d, {"effective_fps", "max_width", "fps_override", "duration_s",
+                "frame_start", "frame_end",
                 "time_start", "time_end", "roi", "method", "yolo"}, "processing"
         )
         method = _get_enum(d, "method", "processing", "mog2", {"mog2", "yolo"})
@@ -412,8 +416,11 @@ class ProcessingConfig:
         fps_ovr = float(d.get("fps_override") or 0.0)
         if fps_ovr < 0:
             raise ConfigError(f"processing.fps_override: ожидалось >= 0, получено {fps_ovr!r}")
+        dur_s = float(d.get("duration_s") or 0.0)
+        if dur_s < 0:
+            raise ConfigError(f"processing.duration_s: ожидалось >= 0, получено {dur_s!r}")
         return cls(effective_fps=eff, max_width=mw, fps_override=fps_ovr,
-                   frame_start=fs, frame_end=fe,
+                   duration_s=dur_s, frame_start=fs, frame_end=fe,
                    time_start=ts, time_end=te, roi=roi, method=method, yolo=yolo)
 
 

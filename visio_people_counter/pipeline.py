@@ -266,15 +266,27 @@ class Pipeline:
         self.event_log = EventLog(self.cfg)
         return self
 
+    def _resolve_fps(self) -> float:
+        """Определить реальный fps: fps_override → duration_s+frame_count → source.fps."""
+        p = self.cfg.processing
+        if p.fps_override > 0:
+            return p.fps_override
+        if p.duration_s > 0 and self.source is not None:
+            fc = getattr(self.source, 'frame_count', 0)
+            if fc and fc > 0:
+                fps = fc / p.duration_s
+                _emit(f"fps из duration_s: {fc} кадров / {p.duration_s:g}s = {fps:.3f} fps")
+                return fps
+        return self.source.fps if self.source else 0.0
+
     def _apply_time_bounds(self) -> None:
         """Пересчитать frame_start/frame_end из time_start/time_end (сек → кадры).
 
         Приоритет: если time_start задан — frame_start = int(time_start * fps);
         аналогично time_end → frame_end. Старые frame_* без time_* не трогаются.
-        fps берётся из fps_override (если > 0), иначе source.fps.
         """
         p = self.cfg.processing
-        fps = p.fps_override if p.fps_override > 0 else (self.source.fps if self.source else 0)
+        fps = self._resolve_fps()
         if not fps:
             return   # fps неизвестен — не можем конвертировать
         if p.time_start is not None:

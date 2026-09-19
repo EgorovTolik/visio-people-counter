@@ -289,6 +289,13 @@ class FileSource(VideoSource):
         return self._fps
 
     @property
+    def frame_count(self) -> int:
+        """Всего кадров в файле (cv2.CAP_PROP_FRAME_COUNT; 0 — неизвестно)."""
+        if self._cap is None:
+            return 0
+        return int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    @property
     def duration(self) -> float:
         """Длительность файла, с (FRAME_COUNT/fps; фолбэк CAP_PROP_DURATION). 0.0 — неизвестна."""
         if self._cap is None:

@@ -397,9 +397,14 @@ class GuiPlayer:
         if frame_index is not None:
             # время/продолжительность: hh:mm:ss
             src = getattr(self.pipeline, 'source', None)
-            fps_ovr = self.cfg.processing.fps_override
-            fps = fps_ovr if fps_ovr > 0 else (getattr(src, 'fps', 0) if src else 0)
-            duration = getattr(src, 'duration', 0) if src else 0
+            p_cfg = self.cfg.processing
+            if p_cfg.fps_override > 0:
+                fps = p_cfg.fps_override
+            elif p_cfg.duration_s > 0 and hasattr(src, 'frame_count') and src.frame_count > 0:
+                fps = src.frame_count / p_cfg.duration_s
+            else:
+                fps = getattr(src, 'fps', 0) if src else 0
+            duration = p_cfg.duration_s if p_cfg.duration_s > 0 else (getattr(src, 'duration', 0) if src else 0)
             # если frame_end задан — показываем ограниченную длительность (time_end)
             fe = self.cfg.processing.frame_end
             if fe is not None and fps > 0:
@@ -619,10 +624,16 @@ class GuiPlayer:
         # задача 14: маленький кадр (маленький ROI) → авто-увеличение масштаба
         # отображения, чтобы UI был доступен; user --scale — минимум; статус покажет scale=…x
         self.scale = auto_ui_scale(src.width, src.height, self.scale)
-        fps_ovr = self.cfg.processing.fps_override
-        fps = fps_ovr if fps_ovr > 0 else float(src.fps or 0.0)
+        # fps: override → duration_s+frame_count → source.fps → effective_fps
+        p_cfg = self.cfg.processing
+        if p_cfg.fps_override > 0:
+            fps = p_cfg.fps_override
+        elif p_cfg.duration_s > 0 and hasattr(src, 'frame_count') and src.frame_count > 0:
+            fps = src.frame_count / p_cfg.duration_s
+        else:
+            fps = float(src.fps or 0.0)
         if fps <= 0:
-            fps = float(self.cfg.processing.effective_fps or 25.0)
+            fps = float(p_cfg.effective_fps or 25.0)
         _emit(f"GUI-режим: окно {self.window_name!r}, speed={self.speed:g}x "
               f"(+/- ×/÷1.5, ,/. масштаб 0.5-2 только экран, space — пауза, q/ESC — выход)")
 
